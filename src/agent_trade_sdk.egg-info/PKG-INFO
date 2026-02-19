@@ -7,6 +7,7 @@ Description-Content-Type: text/markdown
 Requires-Dist: openai-agents[litellm]>=0.9.2
 Requires-Dist: alpaca-py>=0.36.0
 Requires-Dist: tavily-python>=0.5.0
+Requires-Dist: yfinance>=0.2.54
 Requires-Dist: python-dotenv>=1.0.1
 Requires-Dist: pydantic>=2.8.0
 Provides-Extra: dev
@@ -40,7 +41,15 @@ Remplis ensuite `.env` avec tes clés.
 python scripts/test_tavily_search.py --query "NVIDIA earnings market reaction today"
 ```
 
-## 3) Tester Alpaca (paper trading)
+## 3) Tester Yahoo Finance (snapshot marché)
+
+```bash
+python scripts/test_yfinance_market.py --action snapshot --symbols-csv "SPY,QQQ,AAPL,TSLA,NVDA"
+python scripts/test_yfinance_market.py --action quote --symbol SPY
+python scripts/test_yfinance_market.py --action history --symbol SPY --period 1mo --interval 1d
+```
+
+## 4) Tester Alpaca (paper trading)
 
 Recommandé: commencer par `--dry-run`.
 

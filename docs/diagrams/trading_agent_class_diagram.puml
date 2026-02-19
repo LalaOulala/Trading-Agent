@@ -29,6 +29,12 @@ class TavilySearchTool {
   +search_social(keyword, max_results) dict
 }
 
+class YFinanceMarketTool {
+  +quote(symbol) dict
+  +history(symbol, period, interval, max_points) dict
+  +snapshot(symbols_csv) dict
+}
+
 class AlpacaPaperBroker {
   +get_account() dict
   +get_positions() list
@@ -37,6 +43,9 @@ class AlpacaPaperBroker {
 }
 
 class TradingFunctionTools {
+  +get_market_snapshot(...) str
+  +get_market_quote(...) str
+  +get_price_history(...) str
   +web_search_tavily(...) str
   +social_signal_search(...) str
   +place_market_order(...) str
@@ -47,6 +56,7 @@ class TradingFunctionTools {
 class Agent <<external>>
 class LitellmModel <<external>>
 class TavilyClient <<external>>
+class YFinance <<external>>
 class TradingClient <<external>>
 
 TradingAgentFactory --> Settings
@@ -57,8 +67,10 @@ TradingAgentFactory --> Agent
 
 AgentRunner --> TradingAgentFactory
 TradingFunctionTools --> TavilySearchTool
+TradingFunctionTools --> YFinanceMarketTool
 TradingFunctionTools --> AlpacaPaperBroker
 TavilySearchTool --> TavilyClient
+YFinanceMarketTool --> YFinance
 AlpacaPaperBroker --> TradingClient
 
 @enduml

@@ -12,9 +12,11 @@ Construire un socle propre pour un agent autonome de trading simulé:
 
 1. **Orchestration agentique**: `openai-agents-python` (primitives simples: `Agent`, `Runner`, `@function_tool`, loop intégré)
 2. **Modèle LLM**: `LitellmModel` vers OpenRouter
-3. **Recherche web/social**: Tavily (phase 1), requêtes sociales via filtres de domaines
-4. **Execution trading**: `alpaca-py` (paper trading API)
-5. **Config**: `.env` + `python-dotenv`
+3. **Données de marché**: Yahoo Finance via `yfinance` (quote, historique, snapshot)
+4. **Recherche web/social**: Tavily (phase 1), requêtes sociales via filtres de domaines
+5. **Execution trading**: `alpaca-py` (paper trading API)
+6. **Config**: `.env` + `python-dotenv`
+7. **Journal V1**: logs Markdown par session (`logs/session_*.md`)
 
 ## Pourquoi Tavily en phase 1
 
@@ -45,13 +47,15 @@ agent_trade_sdk/
 │       └── trading_agent_class_diagram.puml
 ├── scripts/
 │   ├── test_alpaca_order.py
-│   └── test_tavily_search.py
+│   ├── test_tavily_search.py
+│   └── test_yfinance_market.py
 └── src/
     └── agent_trade_sdk/
         ├── agent.py
         ├── config.py
         ├── runner.py
         └── tools/
+            ├── market_data.py
             ├── search.py
             └── trading.py
 ```
@@ -82,7 +86,8 @@ def place_market_order(
 
 1. Prompt utilisateur
 2. Agent planifie l'enquête
-3. Tool Tavily web/social
-4. Synthèse + décision
-5. Tool Alpaca (paper order)
-6. Logging de la décision et de l'exécution
+3. Tools Yahoo Finance (snapshot/quote/historique)
+4. Tool Tavily web/social
+5. Synthèse + décision
+6. Tool Alpaca (paper order)
+7. Logging de la décision et de l'exécution

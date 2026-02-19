@@ -3,6 +3,7 @@
 Prototype de base pour un agent de trading simulé:
 - Orchestration agentique avec `openai-agents-python`
 - Modèle via OpenRouter en passant par `LitellmModel`
+- Données de marché via `yfinance`
 - Tools de recherche web/social via Tavily
 - Tools de paper trading via Alpaca
 
@@ -25,7 +26,15 @@ Remplis ensuite `.env` avec tes clés.
 python scripts/test_tavily_search.py --query "NVIDIA earnings market reaction today"
 ```
 
-## 3) Tester Alpaca (paper trading)
+## 3) Tester Yahoo Finance (snapshot marché)
+
+```bash
+python scripts/test_yfinance_market.py --action snapshot --symbols-csv "SPY,QQQ,AAPL,TSLA,NVDA"
+python scripts/test_yfinance_market.py --action quote --symbol SPY
+python scripts/test_yfinance_market.py --action history --symbol SPY --period 1mo --interval 1d
+```
+
+## 4) Tester Alpaca (paper trading)
 
 Recommandé: commencer par `--dry-run`.
 
@@ -37,10 +46,23 @@ python scripts/test_alpaca_order.py --action positions
 python scripts/test_alpaca_order.py --action close --symbol SPY
 ```
 
-## 4) Lancer un run agent unique
+## 5) Lancer un run agent unique
 
 ```bash
 python -m agent_trade_sdk.runner --prompt "Analyse AAPL et propose une action avec justification."
+```
+
+Le runner V1 crée un log Markdown de session (tracing désactivé par défaut) dans `logs/`.
+Pour changer le dossier:
+
+```bash
+python -m agent_trade_sdk.runner --prompt "..." --log-dir logs
+```
+
+Pour réactiver explicitement le tracing SDK:
+
+```bash
+python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
 ```
 
 ## Notes de sécurité
