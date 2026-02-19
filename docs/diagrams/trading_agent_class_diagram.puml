@@ -1,0 +1,64 @@
+@startuml
+skinparam classAttributeIconSize 0
+
+class Settings {
+  +openrouter_api_key: str
+  +openrouter_model: str
+  +openrouter_base_url: str
+  +tavily_api_key: str
+  +alpaca_api_key: str
+  +alpaca_secret_key: str
+  +alpaca_paper: bool
+  +alpaca_base_url: str
+}
+
+class SoulProfile {
+  +load() str
+}
+
+class TradingAgentFactory {
+  +build(model_name: str = None) Agent
+}
+
+class AgentRunner {
+  +run_once(prompt: str) str
+}
+
+class TavilySearchTool {
+  +search_web(query, max_results, topic, time_range) dict
+  +search_social(keyword, max_results) dict
+}
+
+class AlpacaPaperBroker {
+  +get_account() dict
+  +get_positions() list
+  +submit_market_order(symbol, side, qty, notional, tif) dict
+  +close_position(symbol) dict
+}
+
+class TradingFunctionTools {
+  +web_search_tavily(...) str
+  +social_signal_search(...) str
+  +place_market_order(...) str
+  +open_short_position(...) str
+  +close_open_position(...) str
+}
+
+class Agent <<external>>
+class LitellmModel <<external>>
+class TavilyClient <<external>>
+class TradingClient <<external>>
+
+TradingAgentFactory --> Settings
+TradingAgentFactory --> SoulProfile
+TradingAgentFactory --> LitellmModel
+TradingAgentFactory --> TradingFunctionTools
+TradingAgentFactory --> Agent
+
+AgentRunner --> TradingAgentFactory
+TradingFunctionTools --> TavilySearchTool
+TradingFunctionTools --> AlpacaPaperBroker
+TavilySearchTool --> TavilyClient
+AlpacaPaperBroker --> TradingClient
+
+@enduml
