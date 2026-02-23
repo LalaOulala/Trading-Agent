@@ -1,0 +1,12 @@
+# Runtime dependencies (project + local test scripts)
+openai-agents[litellm]>=0.9.2
+alpaca-py>=0.36.0
+tavily-python>=0.5.0
+yfinance>=0.2.54
+python-dotenv>=1.0.1
+pydantic>=2.8.0
+perplexityai>=0.29.1
+
+# Optional dev tools (uncomment if needed)
+# ruff>=0.8.0
+# pytest>=8.0.0

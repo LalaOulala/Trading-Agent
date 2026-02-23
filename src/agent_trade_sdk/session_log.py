@@ -39,6 +39,12 @@ def _safe_dump(data: Any, max_chars: int = 6000) -> str:
     return text
 
 
+def _truncate_text(value: str, max_chars: int = 800) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + " ... (truncated)"
+
+
 def _to_mapping(raw_item: Any) -> dict[str, Any]:
     if isinstance(raw_item, dict):
         return raw_item
@@ -102,6 +108,10 @@ class SessionMarkdownLogger:
     file_path: Path = field(init=False)
     event_index: int = field(default=0, init=False)
     _call_id_to_tool: dict[str, str] = field(default_factory=dict, init=False)
+    _tool_calls_summary: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _tool_outputs_summary: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _reasoning_summaries: list[str] = field(default_factory=list, init=False)
+    _message_outputs: list[str] = field(default_factory=list, init=False)
 
     _alpaca_order_tools: set[str] = field(
         default_factory=lambda: {"place_market_order", "open_short_position", "close_open_position"},
@@ -186,6 +196,16 @@ class SessionMarkdownLogger:
             if tool_name in self._alpaca_order_tools:
                 self._append("- category: `alpaca_order`\n")
             arguments = raw.get("arguments")
+            self._tool_calls_summary.append(
+                {
+                    "event_index": self.event_index,
+                    "tool_name": tool_name,
+                    "call_id": call_id or None,
+                    "arguments_excerpt": _truncate_text(_safe_dump(arguments, max_chars=1200))
+                    if arguments is not None
+                    else None,
+                }
+            )
             if arguments:
                 self._append("\n**Tool arguments**\n\n")
                 self._append(f"```json\n{_safe_dump(arguments)}\n```\n")
@@ -204,12 +224,31 @@ class SessionMarkdownLogger:
             if tool_name in self._alpaca_order_tools:
                 self._append("- category: `alpaca_order_execution`\n")
             output_value = getattr(event.item, "output", None)
+            output_excerpt = _truncate_text(_safe_dump(output_value, max_chars=1500))
+            is_error = "error" in output_excerpt.lower()
+            self._tool_outputs_summary.append(
+                {
+                    "event_index": self.event_index,
+                    "tool_name": tool_name,
+                    "call_id": call_id or None,
+                    "is_error": is_error,
+                    "category": (
+                        "snapshot_update"
+                        if tool_name in self._snapshot_tools
+                        else "alpaca_order_execution"
+                        if tool_name in self._alpaca_order_tools
+                        else None
+                    ),
+                    "output_excerpt": output_excerpt,
+                }
+            )
             self._append("\n**Tool output**\n\n")
             self._append(f"```json\n{_safe_dump(output_value)}\n```\n")
 
         elif event.name == "reasoning_item_created":
             summary = _extract_reasoning_summary(raw)
             if summary:
+                self._reasoning_summaries.append(_truncate_text(summary, max_chars=2000))
                 self._append(f"\n**Reasoning summary**\n\n{summary}\n")
             else:
                 self._append("\n**Reasoning raw item**\n\n")
@@ -218,6 +257,7 @@ class SessionMarkdownLogger:
         elif event.name == "message_output_created":
             text = _extract_message_text(raw)
             if text:
+                self._message_outputs.append(_truncate_text(text, max_chars=3000))
                 self._append("\n**Message output**\n\n")
                 self._append(f"```text\n{text}\n```\n")
             else:
@@ -228,6 +268,17 @@ class SessionMarkdownLogger:
             self._append(f"```json\n{_safe_dump(raw)}\n```\n")
 
         self._append("\n")
+
+    def build_runtime_summary(self) -> dict[str, Any]:
+        tool_error_count = sum(1 for item in self._tool_outputs_summary if item.get("is_error"))
+        return {
+            "event_count": self.event_index,
+            "tool_calls": self._tool_calls_summary,
+            "tool_outputs": self._tool_outputs_summary,
+            "tool_error_count": tool_error_count,
+            "reasoning_summaries": self._reasoning_summaries[-10:],
+            "message_outputs": self._message_outputs[-10:],
+        }
 
     def log_final_output(self, output: str) -> None:
         finished_utc = _utc_now().isoformat()

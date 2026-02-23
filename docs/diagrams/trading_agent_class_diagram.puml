@@ -1,76 +1,141 @@
 @startuml
 skinparam classAttributeIconSize 0
 
+package "agent_trade_sdk.config" {
 class Settings {
-  +openrouter_api_key: str
+  +openrouter_api_key: str | None
   +openrouter_model: str
   +openrouter_base_url: str
-  +tavily_api_key: str
-  +alpaca_api_key: str
-  +alpaca_secret_key: str
+  +tavily_api_key: str | None
+  +social_search_mode: str
+  +social_search_sites: tuple[str, ...]
+  +alpaca_api_key: str | None
+  +alpaca_secret_key: str | None
   +alpaca_paper: bool
   +alpaca_base_url: str
+  +trading_allowed_symbols: tuple[str, ...]
+  +trading_max_notional_usd: float | None
+  +from_env(require_openrouter: bool = True) Settings
+}
 }
 
-class SoulProfile {
-  +load() str
+package "agent_trade_sdk.agent" {
+class TradingAgentBuilder <<module>> {
+  +build_trading_agent(model_name: str | None = None) Agent
+  +_load_soul_text(path: Path = SOUL_PATH) str
+}
 }
 
-class TradingAgentFactory {
-  +build(model_name: str = None) Agent
+package "agent_trade_sdk.tools.search" {
+class SearchTools <<module>> {
+  +tavily_search_raw(query, max_results, topic, time_range) dict
+  +web_search_tavily(query, max_results, topic, time_range) str
+  +social_signal_search(keyword, max_results, time_range) str
+  +_build_tavily_client() TavilyClient
+}
 }
 
-class AgentRunner {
-  +run_once(prompt: str) str
+package "agent_trade_sdk.tools.market_data" {
+class MarketDataTools <<module>> {
+  +yfinance_quote_raw(symbol) dict
+  +get_market_quote(symbol) str
+  +yfinance_price_history_raw(symbol, period, interval, max_points) dict
+  +get_price_history(symbol, period, interval, max_points) str
+  +yfinance_market_snapshot_raw(symbols_csv) dict
+  +get_market_snapshot(symbols_csv) str
+}
 }
 
-class TavilySearchTool {
-  +search_web(query, max_results, topic, time_range) dict
-  +search_social(keyword, max_results) dict
-}
-
-class YFinanceMarketTool {
-  +quote(symbol) dict
-  +history(symbol, period, interval, max_points) dict
-  +snapshot(symbols_csv) dict
+package "agent_trade_sdk.tools.trading" {
+class AlpacaConnectionConfig {
+  +api_key: str
+  +secret_key: str
+  +paper: bool
+  +base_url: str
+  +allowed_symbols: tuple[str, ...]
+  +max_notional_usd: float | None
+  +from_env() AlpacaConnectionConfig
 }
 
 class AlpacaPaperBroker {
   +get_account() dict
   +get_positions() list
-  +submit_market_order(symbol, side, qty, notional, tif) dict
+  +submit_market_order(symbol, side, qty, notional, time_in_force) dict
   +close_position(symbol) dict
 }
 
-class TradingFunctionTools {
-  +get_market_snapshot(...) str
-  +get_market_quote(...) str
-  +get_price_history(...) str
-  +web_search_tavily(...) str
-  +social_signal_search(...) str
+class TradingTools <<module>> {
+  +get_account_snapshot() str
+  +list_open_positions() str
   +place_market_order(...) str
   +open_short_position(...) str
   +close_open_position(...) str
 }
+}
+
+package "agent_trade_sdk.runner" {
+class RunnerModule <<module>> {
+  +run_once(prompt, model, log_dir, enable_tracing) tuple[str, Path]
+  +_collect_input_snapshot() dict
+  +main() None
+}
+}
+
+package "agent_trade_sdk.session_log" {
+class SessionMarkdownLogger {
+  +log_input_snapshot(snapshot) None
+  +log_stream_event(event) None
+  +log_final_output(output) None
+  +log_error(error) None
+}
+}
 
 class Agent <<external>>
+class ModelSettings <<external>>
 class LitellmModel <<external>>
 class TavilyClient <<external>>
-class YFinance <<external>>
+class "yf.Ticker" as YFinanceTicker <<external>>
 class TradingClient <<external>>
+class MarketOrderRequest <<external>>
+class OrderSide <<external>>
+class TimeInForce <<external>>
+class "agents.Runner" as AgentsRunner <<external>>
+class RunConfig <<external>>
+class AgentUpdatedStreamEvent <<external>>
+class RawResponsesStreamEvent <<external>>
+class RunItemStreamEvent <<external>>
 
-TradingAgentFactory --> Settings
-TradingAgentFactory --> SoulProfile
-TradingAgentFactory --> LitellmModel
-TradingAgentFactory --> TradingFunctionTools
-TradingAgentFactory --> Agent
+TradingAgentBuilder --> Settings
+TradingAgentBuilder --> LitellmModel
+TradingAgentBuilder --> ModelSettings
+TradingAgentBuilder --> SearchTools
+TradingAgentBuilder --> MarketDataTools
+TradingAgentBuilder --> TradingTools
+TradingAgentBuilder --> Agent
 
-AgentRunner --> TradingAgentFactory
-TradingFunctionTools --> TavilySearchTool
-TradingFunctionTools --> YFinanceMarketTool
-TradingFunctionTools --> AlpacaPaperBroker
-TavilySearchTool --> TavilyClient
-YFinanceMarketTool --> YFinance
+RunnerModule --> TradingAgentBuilder
+RunnerModule --> Settings
+RunnerModule --> SessionMarkdownLogger
+RunnerModule --> AlpacaPaperBroker
+RunnerModule --> SearchTools : tavily_search_raw
+RunnerModule --> MarketDataTools : yfinance_market_snapshot_raw
+RunnerModule --> AgentsRunner
+RunnerModule --> RunConfig
+
+SearchTools --> Settings
+SearchTools --> TavilyClient
+MarketDataTools --> YFinanceTicker
+
+TradingTools --> AlpacaPaperBroker
+AlpacaConnectionConfig --> Settings
+AlpacaPaperBroker *-- AlpacaConnectionConfig
 AlpacaPaperBroker --> TradingClient
+AlpacaPaperBroker --> MarketOrderRequest
+AlpacaPaperBroker --> OrderSide
+AlpacaPaperBroker --> TimeInForce
+
+SessionMarkdownLogger --> AgentUpdatedStreamEvent
+SessionMarkdownLogger --> RawResponsesStreamEvent
+SessionMarkdownLogger --> RunItemStreamEvent
 
 @enduml

@@ -26,6 +26,16 @@ def _env_float(name: str) -> float | None:
         raise ValueError(f"Environment variable {name} must be a float, got: {raw}") from exc
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an int, got: {raw}") from exc
+
+
 def _env_csv(name: str, default: str) -> tuple[str, ...]:
     raw = os.getenv(name, default)
     items = [item.strip() for item in raw.split(",") if item.strip()]
@@ -37,6 +47,12 @@ class Settings:
     openrouter_api_key: str | None
     openrouter_model: str
     openrouter_base_url: str
+    perplexity_api_key: str | None
+    perplexity_model: str
+    perplexity_snapshot_search_recency: str
+    perplexity_snapshot_search_context_size: str
+    perplexity_snapshot_max_tokens: int
+    perplexity_snapshot_system_prompt: str
     tavily_api_key: str | None
     social_search_mode: str
     social_search_sites: tuple[str, ...]
@@ -57,6 +73,19 @@ class Settings:
             openrouter_api_key=openrouter_api_key,
             openrouter_model=os.getenv("OPENROUTER_MODEL", "openrouter/openai/gpt-4o-mini"),
             openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            perplexity_api_key=os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY"),
+            perplexity_model=os.getenv("PERPLEXITY_MODEL", "sonar"),
+            perplexity_snapshot_search_recency=os.getenv(
+                "PERPLEXITY_SNAPSHOT_SEARCH_RECENCY", "day"
+            ),
+            perplexity_snapshot_search_context_size=os.getenv(
+                "PERPLEXITY_SNAPSHOT_SEARCH_CONTEXT_SIZE", "medium"
+            ),
+            perplexity_snapshot_max_tokens=_env_int("PERPLEXITY_SNAPSHOT_MAX_TOKENS", 1200),
+            perplexity_snapshot_system_prompt=os.getenv(
+                "PERPLEXITY_SNAPSHOT_SYSTEM_PROMPT",
+                "Réponds en français, concis, style desk.",
+            ),
             tavily_api_key=os.getenv("TAVILY_API_KEY"),
             social_search_mode=os.getenv("SOCIAL_SEARCH_MODE", "tavily_sites"),
             social_search_sites=_env_csv("SOCIAL_SEARCH_SITES", "x.com,reddit.com,stocktwits.com"),

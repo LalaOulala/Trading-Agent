@@ -42,10 +42,12 @@ def build_trading_agent(model_name: str | None = None) -> Agent:
     instructions = (
         f"{_load_soul_text()}\n\n"
         "Execution protocol:\n"
-        "1) Gather evidence with market-data and search tools before placing an order.\n"
-        "2) Explain rationale, risk, and invalidation level.\n"
-        "3) Use trading tools only on paper account.\n"
-        "4) If confidence is low, do not trade."
+        "1) Start from the pre-run snapshot provided in the prompt, then verify/refresh critical facts with "
+        "tools.\n"
+        "2) Gather evidence iteratively: one result may trigger follow-up searches before any trade decision.\n"
+        "3) Explain rationale, risk, and invalidation level.\n"
+        "4) Use trading tools only on paper account.\n"
+        "5) If confidence is low or evidence is contradictory, do not trade."
     )
 
     return Agent(

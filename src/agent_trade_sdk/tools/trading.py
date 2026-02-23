@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 from agents import function_tool
@@ -133,6 +134,28 @@ class AlpacaPaperBroker:
             }
             for position in positions
         ]
+
+    def get_market_clock(self) -> dict[str, Any]:
+        clock = self.client.get_clock()
+
+        def _iso(value: Any) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value.isoformat()
+            if hasattr(value, "isoformat"):
+                try:
+                    return value.isoformat()
+                except Exception:
+                    return str(value)
+            return str(value)
+
+        return {
+            "is_open": bool(getattr(clock, "is_open", False)),
+            "timestamp": _iso(getattr(clock, "timestamp", None)),
+            "next_open": _iso(getattr(clock, "next_open", None)),
+            "next_close": _iso(getattr(clock, "next_close", None)),
+        }
 
     def submit_market_order(
         self,
