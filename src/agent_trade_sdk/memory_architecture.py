@@ -17,6 +17,8 @@ SHORT_MEMORY_ARCHIVE_DIR = SHORT_MEMORY_DIR / "archive"
 BEHAVIOR_PATH = ROOT_DIR / "behavior.md"
 
 TradingAction = Literal["BUY", "SELL", "SHORT", "CLOSE", "NO_TRADE"]
+TRADING_TOOL_NAMES = {"place_market_order", "open_short_position", "close_open_position"}
+TRADING_ACTIONS = {"BUY", "SELL", "SHORT", "CLOSE"}
 
 
 def _utc_now() -> datetime:
@@ -120,6 +122,8 @@ class ShortMemoryRecord(BaseModel):
     pitfalls_to_avoid_next_run: list[str] = Field(default_factory=list)
     next_session_directives: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
+    system_warnings: list[str] = Field(default_factory=list)
+    execution_validation: dict[str, Any] | None = None
     long_memory_update_intent: dict[str, Any]
     trading_decision: dict[str, Any]
 
@@ -140,6 +144,8 @@ class MemoryApplyResult:
     short_memory_latest_path: Path | None
     short_memory_archive_path: Path | None
     behavior_history: BehaviorHistoryResult | None
+    system_warnings: list[str]
+    execution_validation: dict[str, Any] | None
     parse_error: str | None
 
     def summary_for_log(self) -> dict[str, Any]:
@@ -158,6 +164,8 @@ class MemoryApplyResult:
             "behavior_diff_path": str(behavior.diff_path) if behavior and behavior.diff_path else None,
             "behavior_reason": behavior.reason if behavior else None,
             "behavior_update_summary": behavior.summary if behavior else [],
+            "system_warnings": self.system_warnings,
+            "execution_validation": self.execution_validation,
         }
 
 
@@ -256,6 +264,8 @@ def _write_short_memory(
     parsed_output: TradingSessionLLMOutput,
     session_id: str,
     model_name: str,
+    system_warnings: list[str] | None = None,
+    execution_validation: dict[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     record = ShortMemoryRecord(
         generated_at_utc=_utc_now().isoformat(),
@@ -267,6 +277,8 @@ def _write_short_memory(
         pitfalls_to_avoid_next_run=parsed_output.pitfalls_to_avoid_next_run,
         next_session_directives=parsed_output.next_session_directives,
         open_questions=parsed_output.open_questions,
+        system_warnings=system_warnings or [],
+        execution_validation=execution_validation,
         long_memory_update_intent=parsed_output.long_memory_update_intent.model_dump(
             exclude={"updated_behavior_markdown"}
         ),
@@ -331,12 +343,128 @@ def _archive_behavior_update(
     )
 
 
+def _runtime_trading_execution_audit(runtime_summary: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(runtime_summary, dict):
+        return {
+            "trading_tool_calls_count": 0,
+            "trading_tool_outputs_count": 0,
+            "trading_tool_success_count": 0,
+            "trading_tool_error_count": 0,
+            "trading_tools_called": [],
+        }
+
+    tool_calls = runtime_summary.get("tool_calls") or []
+    tool_outputs = runtime_summary.get("tool_outputs") or []
+    trading_calls = [
+        item
+        for item in tool_calls
+        if isinstance(item, dict) and str(item.get("tool_name")) in TRADING_TOOL_NAMES
+    ]
+    trading_outputs = [
+        item
+        for item in tool_outputs
+        if isinstance(item, dict) and str(item.get("tool_name")) in TRADING_TOOL_NAMES
+    ]
+    trading_success = [item for item in trading_outputs if not bool(item.get("is_error"))]
+    trading_errors = [item for item in trading_outputs if bool(item.get("is_error"))]
+    return {
+        "trading_tool_calls_count": len(trading_calls),
+        "trading_tool_outputs_count": len(trading_outputs),
+        "trading_tool_success_count": len(trading_success),
+        "trading_tool_error_count": len(trading_errors),
+        "trading_tools_called": sorted(
+            {str(item.get("tool_name")) for item in trading_calls if item.get("tool_name")}
+        ),
+        "last_trading_tool_output_excerpt": trading_outputs[-1].get("output_excerpt") if trading_outputs else None,
+    }
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
+
+
+def _enforce_trading_execution_consistency(
+    parsed: TradingSessionLLMOutput,
+    *,
+    runtime_summary: dict[str, Any] | None,
+) -> tuple[list[str], dict[str, Any] | None]:
+    audit = _runtime_trading_execution_audit(runtime_summary)
+    warnings: list[str] = []
+    decision = parsed.trading_decision
+    action = decision.action
+    success_count = int(audit.get("trading_tool_success_count") or 0)
+    call_count = int(audit.get("trading_tool_calls_count") or 0)
+
+    if action in TRADING_ACTIONS and success_count == 0:
+        if call_count > 0:
+            warning = (
+                "Validation d'exécution: action de trade déclarée "
+                f"({action}) mais aucun tool de trading n'a réussi pendant ce run "
+                f"(calls={call_count}, successes=0). executed_order a été invalidé (null)."
+            )
+        else:
+            warning = (
+                "Validation d'exécution: action de trade déclarée "
+                f"({action}) sans aucun appel à un tool de trading pendant ce run. "
+                "executed_order a été invalidé (null) et aucun ordre Alpaca n'a été soumis."
+            )
+        warnings.append(warning)
+        decision.executed_order = None
+        _append_unique(parsed.pitfalls_to_avoid_next_run, "Ne jamais déclarer un ordre exécuté sans tool Alpaca réussi.")
+        _append_unique(
+            parsed.next_session_directives,
+            "Si tu choisis BUY/SELL/SHORT/CLOSE, appelle un tool de trading puis recopie fidèlement son JSON dans executed_order.",
+        )
+        parsed.self_critique = (
+            parsed.self_critique.rstrip()
+            + " [WARNING SYSTEME: décision de trade sans exécution Alpaca confirmée; executed_order invalidé.]"
+        )
+    elif action in TRADING_ACTIONS and success_count > 0 and decision.executed_order is None:
+        warnings.append(
+            "Validation d'exécution: un tool de trading a réussi pendant ce run mais executed_order est null dans la sortie finale. "
+            "La mémoire conserve l'action, mais l'output LLM n'a pas recopié fidèlement l'exécution."
+        )
+        _append_unique(
+            parsed.next_session_directives,
+            "Quand un tool de trading réussit, recopie son JSON réel dans executed_order (sans reformater ni inventer).",
+        )
+    elif action == "NO_TRADE" and success_count > 0:
+        warnings.append(
+            "Validation d'exécution: NO_TRADE déclaré alors qu'un tool de trading a réussi pendant ce run. "
+            "La sortie finale est incohérente avec les appels de tools."
+        )
+
+    if action == "NO_TRADE" and decision.executed_order is not None:
+        warnings.append(
+            "Validation d'exécution: executed_order non null alors que l'action est NO_TRADE. executed_order a été invalidé (null)."
+        )
+        decision.executed_order = None
+
+    if not warnings:
+        return [], {
+            **audit,
+            "status": "ok",
+            "decision_action": action,
+            "llm_executed_order_present": decision.executed_order is not None,
+        }
+
+    return warnings, {
+        **audit,
+        "status": "warning",
+        "decision_action": action,
+        "llm_executed_order_present": decision.executed_order is not None,
+        "warnings": warnings,
+    }
+
+
 def apply_memory_outputs(
     *,
     raw_final_output: str,
     session_id: str,
     model_name: str,
     logs_root: Path,
+    runtime_summary: dict[str, Any] | None = None,
 ) -> MemoryApplyResult:
     try:
         parsed = parse_llm_trading_session_output(raw_final_output)
@@ -346,13 +474,22 @@ def apply_memory_outputs(
             short_memory_latest_path=None,
             short_memory_archive_path=None,
             behavior_history=None,
+            system_warnings=[],
+            execution_validation=None,
             parse_error=f"{type(exc).__name__}: {exc}",
         )
+
+    system_warnings, execution_validation = _enforce_trading_execution_consistency(
+        parsed,
+        runtime_summary=runtime_summary,
+    )
 
     short_latest, short_archive = _write_short_memory(
         parsed_output=parsed,
         session_id=session_id,
         model_name=model_name,
+        system_warnings=system_warnings,
+        execution_validation=execution_validation,
     )
 
     behavior_intent = parsed.long_memory_update_intent
@@ -387,6 +524,8 @@ def apply_memory_outputs(
         short_memory_latest_path=short_latest,
         short_memory_archive_path=short_archive,
         behavior_history=behavior_history,
+        system_warnings=system_warnings,
+        execution_validation=execution_validation,
         parse_error=None,
     )
 
@@ -397,8 +536,18 @@ def short_memory_prompt_block(short_memory: dict[str, Any] | None) -> str:
             "### Mémoire courte (session précédente)\n"
             "Aucune mémoire courte disponible (premier run ou mémoire indisponible).\n"
         )
+    warnings = short_memory.get("system_warnings") if isinstance(short_memory, dict) else None
+    warning_block = ""
+    if isinstance(warnings, list) and warnings:
+        warning_lines = "\n".join(f"- {str(item)}" for item in warnings[:5])
+        warning_block = (
+            "### Avertissements système (session précédente)\n"
+            "Ces avertissements proviennent du code (validation d'exécution / cohérence) et priment sur tes suppositions.\n"
+            f"{warning_lines}\n\n"
+        )
     return (
         "### Mémoire courte (session précédente)\n"
         "Utilise cette mémoire pour garder un fil conducteur et éviter de répéter les mêmes erreurs.\n"
+        f"{warning_block}"
         f"```json\n{_safe_json(short_memory, max_chars=50000)}\n```\n"
     )

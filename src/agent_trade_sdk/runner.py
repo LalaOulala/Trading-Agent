@@ -374,14 +374,15 @@ async def run_once(
 
     final_output = str(result.final_output)
     logger.log_final_output(final_output)
+    runtime_summary = logger.build_runtime_summary()
     memory_apply_result = apply_memory_outputs(
         raw_final_output=final_output,
         session_id=session_id,
         model_name=model_name,
         logs_root=_logs_root_path(log_dir),
+        runtime_summary=runtime_summary,
     )
     logger.log_memory_apply_result(memory_apply_result.summary_for_log())
-    runtime_summary = logger.build_runtime_summary()
     return RunCycleResult(
         final_output=final_output,
         log_path=logger.file_path,
@@ -468,6 +469,8 @@ async def run_loop(
                         f"short={memory_info.get('short_memory_latest_path')} "
                         f"behavior_updated={memory_info.get('behavior_updated')}"
                     )
+                    for warning in memory_info.get("system_warnings") or []:
+                        print(f"[memory-warning] {warning}")
                     if memory_info.get("behavior_diff_path"):
                         print(f"[memory] behavior_diff={memory_info['behavior_diff_path']}")
         except Exception as exc:
@@ -549,6 +552,8 @@ def main() -> None:
             f"short={memory_info.get('short_memory_latest_path')} "
             f"behavior_updated={memory_info.get('behavior_updated')}"
         )
+        for warning in memory_info.get("system_warnings") or []:
+            print(f"[memory-warning] {warning}")
         if memory_info.get("behavior_diff_path"):
             print(f"[memory] behavior_diff={memory_info['behavior_diff_path']}")
 

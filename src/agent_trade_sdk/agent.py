@@ -72,6 +72,13 @@ def build_trading_agent(model_name: str | None = None) -> Agent:
         "respectés.\n"
         "7) Produire en sortie un JSON strict conforme au contrat ci-dessous, incluant résumé de session, "
         "autocritique et directives pour la prochaine session.\n\n"
+        "Règles critiques sur les ordres exécutés (OBLIGATOIRE):\n"
+        "- N'invente jamais executed_order.\n"
+        "- executed_order doit être une copie fidèle (mêmes champs/valeurs utiles) du JSON renvoyé par le tool "
+        "Alpaca réellement appelé pendant CE run.\n"
+        "- Si aucun tool de trading (place_market_order / open_short_position / close_open_position) n'a été "
+        "appelé avec succès pendant ce run, executed_order doit être null.\n"
+        "- Si l'action est NO_TRADE, executed_order doit être null.\n\n"
         "Contrat de sortie JSON (obligatoire, EXACT en top-level):\n"
         "{\n"
         '  "trading_decision": {\n'
