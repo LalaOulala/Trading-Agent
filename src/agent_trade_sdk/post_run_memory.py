@@ -7,12 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agents import Agent, ModelSettings, RunConfig, Runner
+from agents import Agent, ModelSettings, Runner
 from agents.extensions.models.litellm_model import LitellmModel
 from pydantic import BaseModel, Field
 
 from agent_trade_sdk.agent import SOUL_PATH
 from agent_trade_sdk.config import Settings
+from agent_trade_sdk.tracing_support import build_agents_run_config
 
 
 def _utc_now_iso() -> str:
@@ -234,7 +235,18 @@ async def run_post_run_memory_cycle(
     result = await Runner.run(
         reflection_agent,
         prompt,
-        run_config=RunConfig(tracing_disabled=not enable_tracing),
+        run_config=build_agents_run_config(
+            enable_tracing=enable_tracing,
+            workflow_name="agent_trade_sdk.post_run_memory",
+            group_id=session_id,
+            trace_metadata={
+                "component": "post_run_memory",
+                "session_id": session_id,
+                "provider": "openrouter",
+                "model": model_name,
+                "max_turns": 2,
+            },
+        ),
         max_turns=2,
     )
     reflection_output = result.final_output

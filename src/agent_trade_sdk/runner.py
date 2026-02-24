@@ -10,12 +10,21 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from agents import RunConfig, Runner
+from agents import Runner
+from agents.tracing import custom_span, trace as sdk_trace
 
 from agent_trade_sdk.agent import build_trading_agent
 from agent_trade_sdk.config import Settings
-from agent_trade_sdk.post_run_memory import run_post_run_memory_cycle
+from agent_trade_sdk.memory_architecture import (
+    BEHAVIOR_PATH,
+    MemoryApplyResult,
+    apply_memory_outputs,
+    load_behavior_text,
+    load_short_memory_latest,
+    short_memory_prompt_block,
+)
 from agent_trade_sdk.session_log import SessionMarkdownLogger
+from agent_trade_sdk.tracing_support import build_agents_run_config, build_trace_export_config
 from agent_trade_sdk.tools.market_data import yfinance_market_snapshot_raw
 from agent_trade_sdk.tools.perplexity_snapshot import (
     compact_perplexity_snapshot_for_prompt,
@@ -37,6 +46,8 @@ class RunCycleResult:
     input_snapshot: dict[str, Any]
     bootstrap_context: dict[str, Any]
     runtime_summary: dict[str, Any]
+    short_memory_input: dict[str, Any] | None
+    memory_apply_result: MemoryApplyResult
 
 
 def _json_dumps_compact(data: Any) -> str:
@@ -230,20 +241,30 @@ def _build_agent_bootstrap_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     return context
 
 
-def _build_effective_prompt(user_prompt: str, snapshot: dict[str, Any]) -> str:
+def _build_effective_prompt(
+    user_prompt: str,
+    snapshot: dict[str, Any],
+    short_memory: dict[str, Any] | None = None,
+) -> str:
     bootstrap_context = _build_agent_bootstrap_context(snapshot)
     return (
+        f"{short_memory_prompt_block(short_memory)}\n"
         "Contexte de pré-run (snapshot initial déjà collecté avant ton exécution):\n"
         "- Utilise ce snapshot comme point de départ.\n"
         "- Vérifie et approfondis avec les tools si les données sont ambiguës, incomplètes ou possiblement "
         "stales.\n"
-        "- Tu peux enchaîner plusieurs recherches complémentaires (web, social, market data) avant de "
-        "décider.\n"
+        "- Tu peux enchaîner plusieurs recherches complémentaires (web, market data) avant de décider.\n"
         "- Le snapshot n'est pas une vérité absolue: recoupe les signaux avant de trader.\n\n"
         "### Snapshot initial (JSON)\n"
         f"```json\n{_json_dumps_compact(bootstrap_context)}\n```\n\n"
         "### Tâche utilisateur\n"
-        f"{user_prompt}"
+        f"{user_prompt}\n\n"
+        "### Exigences de continuité (mémoire)\n"
+        "- En fin de session, produis un résumé de session, une autocritique, des pièges à éviter, des "
+        "directives pour le prochain run et des questions ouvertes.\n"
+        "- Si tu veux ajuster ta stratégie ou ton style de trading durable, propose une mise à jour complète de "
+        "behavior.md dans long_memory_update_intent.updated_behavior_markdown.\n"
+        "- Si tu ne veux pas modifier behavior.md, mets should_update_behavior=false et updated_behavior_markdown=null.\n"
     )
 
 
@@ -306,10 +327,12 @@ async def run_once(
     model: str | None = None,
     log_dir: str = "logs",
     enable_tracing: bool = False,
+    session_id: str | None = None,
 ) -> RunCycleResult:
+    settings = Settings.from_env(require_openrouter=False)
     agent = build_trading_agent(model_name=model)
-    session_id = uuid.uuid4().hex[:8]
-    model_name = model or Settings.from_env(require_openrouter=False).openrouter_model
+    session_id = session_id or uuid.uuid4().hex[:8]
+    model_name = model or settings.openrouter_model
     logger = SessionMarkdownLogger(
         log_dir=_sessions_log_dir(log_dir),
         prompt=prompt,
@@ -318,12 +341,28 @@ async def run_once(
         session_id=session_id,
     )
 
+    short_memory = load_short_memory_latest()
+    behavior_text = load_behavior_text()
     snapshot = _collect_input_snapshot()
     logger.log_input_snapshot(snapshot)
+    logger.log_short_memory_input(short_memory)
+    logger.log_behavior_input(BEHAVIOR_PATH, behavior_text)
     bootstrap_context = _build_agent_bootstrap_context(snapshot)
-    effective_prompt = _build_effective_prompt(prompt, snapshot)
+    effective_prompt = _build_effective_prompt(prompt, snapshot, short_memory=short_memory)
 
-    run_config = RunConfig(tracing_disabled=not enable_tracing)
+    run_config = build_agents_run_config(
+        enable_tracing=enable_tracing,
+        workflow_name="agent_trade_sdk.main_run",
+        group_id=session_id,
+        trace_metadata={
+            "component": "main_run",
+            "session_id": session_id,
+            "provider": "openrouter",
+            "model": model_name,
+            "streaming": True,
+        },
+        settings=settings,
+    )
 
     try:
         result = Runner.run_streamed(agent, effective_prompt, run_config=run_config)
@@ -335,6 +374,13 @@ async def run_once(
 
     final_output = str(result.final_output)
     logger.log_final_output(final_output)
+    memory_apply_result = apply_memory_outputs(
+        raw_final_output=final_output,
+        session_id=session_id,
+        model_name=model_name,
+        logs_root=_logs_root_path(log_dir),
+    )
+    logger.log_memory_apply_result(memory_apply_result.summary_for_log())
     runtime_summary = logger.build_runtime_summary()
     return RunCycleResult(
         final_output=final_output,
@@ -344,6 +390,8 @@ async def run_once(
         input_snapshot=snapshot,
         bootstrap_context=bootstrap_context,
         runtime_summary=runtime_summary,
+        short_memory_input=short_memory,
+        memory_apply_result=memory_apply_result,
     )
 
 
@@ -371,34 +419,57 @@ async def run_loop(
                 continue
 
         try:
-            cycle = await run_once(
-                prompt=prompt,
-                model=model,
-                log_dir=log_dir,
-                enable_tracing=enable_tracing,
-            )
-            print(cycle.final_output)
-            print(f"\nSession log: {cycle.log_path}")
-
-            try:
-                memory_result = await run_post_run_memory_cycle(
-                    session_id=cycle.session_id,
-                    user_prompt=prompt,
-                    model_name=cycle.model_name,
-                    final_output=cycle.final_output,
-                    bootstrap_context=cycle.bootstrap_context,
-                    runtime_summary=cycle.runtime_summary,
-                    session_log_path=cycle.log_path,
-                    logs_root=_logs_root_path(log_dir),
+            cycle_session_id = uuid.uuid4().hex[:8]
+            tracing_settings = Settings.from_env(require_openrouter=False) if enable_tracing else None
+            cycle_trace = sdk_trace(
+                "agent_trade_sdk.trading_cycle",
+                group_id=cycle_session_id,
+                metadata={
+                    "component": "cycle",
+                    "session_id": cycle_session_id,
+                    "provider": "openrouter",
+                    "model_override": model,
+                    "loop": True,
+                    "interval_minutes": interval_minutes,
+                    "market_hours_only": market_hours_only,
+                },
+                tracing=build_trace_export_config(
                     enable_tracing=enable_tracing,
-                )
-                print(
-                    "[post-run] "
-                    f"journal={memory_result.journal_file_path} "
-                    f"soul_diff={memory_result.soul_diff_path}"
-                )
-            except Exception as exc:
-                print(f"[post-run-error] {type(exc).__name__}: {exc}")
+                    settings=tracing_settings,
+                ),
+                disabled=not enable_tracing,
+            )
+
+            with cycle_trace:
+                with custom_span(
+                    "cycle.main_run",
+                    data={
+                        "session_id": cycle_session_id,
+                        "streaming": True,
+                    },
+                    disabled=not enable_tracing,
+                ):
+                    cycle = await run_once(
+                        prompt=prompt,
+                        model=model,
+                        log_dir=log_dir,
+                        enable_tracing=enable_tracing,
+                        session_id=cycle_session_id,
+                    )
+
+                print(cycle.final_output)
+                print(f"\nSession log: {cycle.log_path}")
+                memory_info = cycle.memory_apply_result.summary_for_log()
+                if memory_info.get("parse_error"):
+                    print(f"[memory-error] {memory_info['parse_error']}")
+                else:
+                    print(
+                        "[memory] "
+                        f"short={memory_info.get('short_memory_latest_path')} "
+                        f"behavior_updated={memory_info.get('behavior_updated')}"
+                    )
+                    if memory_info.get("behavior_diff_path"):
+                        print(f"[memory] behavior_diff={memory_info['behavior_diff_path']}")
         except Exception as exc:
             print(f"[run-error] {type(exc).__name__}: {exc}")
 
@@ -469,6 +540,17 @@ def main() -> None:
     )
     print(cycle.final_output)
     print(f"\nSession log: {cycle.log_path}")
+    memory_info = cycle.memory_apply_result.summary_for_log()
+    if memory_info.get("parse_error"):
+        print(f"[memory-error] {memory_info['parse_error']}")
+    else:
+        print(
+            "[memory] "
+            f"short={memory_info.get('short_memory_latest_path')} "
+            f"behavior_updated={memory_info.get('behavior_updated')}"
+        )
+        if memory_info.get("behavior_diff_path"):
+            print(f"[memory] behavior_diff={memory_info['behavior_diff_path']}")
 
 
 if __name__ == "__main__":

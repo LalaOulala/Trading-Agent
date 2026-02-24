@@ -47,6 +47,7 @@ class Settings:
     openrouter_api_key: str | None
     openrouter_model: str
     openrouter_base_url: str
+    openai_tracing_api_key: str | None
     perplexity_api_key: str | None
     perplexity_model: str
     perplexity_snapshot_search_recency: str
@@ -73,6 +74,7 @@ class Settings:
             openrouter_api_key=openrouter_api_key,
             openrouter_model=os.getenv("OPENROUTER_MODEL", "openrouter/openai/gpt-4o-mini"),
             openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            openai_tracing_api_key=os.getenv("OPENAI_TRACING_API_KEY") or os.getenv("OPENAI_API_KEY"),
             perplexity_api_key=os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY"),
             perplexity_model=os.getenv("PERPLEXITY_MODEL", "sonar"),
             perplexity_snapshot_search_recency=os.getenv(

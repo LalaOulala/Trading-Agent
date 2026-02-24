@@ -6,6 +6,7 @@ class Settings {
   +openrouter_api_key: str | None
   +openrouter_model: str
   +openrouter_base_url: str
+  +openai_tracing_api_key: str | None
   +tavily_api_key: str | None
   +social_search_mode: str
   +social_search_sites: tuple[str, ...]
@@ -23,6 +24,7 @@ package "agent_trade_sdk.agent" {
 class TradingAgentBuilder <<module>> {
   +build_trading_agent(model_name: str | None = None) Agent
   +_load_soul_text(path: Path = SOUL_PATH) str
+  +_load_behavior_text(path: Path = BEHAVIOR_PATH) str
 }
 }
 
@@ -30,7 +32,6 @@ package "agent_trade_sdk.tools.search" {
 class SearchTools <<module>> {
   +tavily_search_raw(query, max_results, topic, time_range) dict
   +web_search_tavily(query, max_results, topic, time_range) str
-  +social_signal_search(keyword, max_results, time_range) str
   +_build_tavily_client() TavilyClient
 }
 }
@@ -74,20 +75,118 @@ class TradingTools <<module>> {
 }
 
 package "agent_trade_sdk.runner" {
+class RunCycleResult {
+  +final_output: str
+  +log_path: Path
+  +session_id: str
+  +model_name: str
+  +input_snapshot: dict
+  +bootstrap_context: dict
+  +runtime_summary: dict
+  +short_memory_input: dict | None
+  +memory_apply_result: MemoryApplyResult
+}
+
 class RunnerModule <<module>> {
-  +run_once(prompt, model, log_dir, enable_tracing) tuple[str, Path]
+  +run_once(prompt, model, log_dir, enable_tracing, session_id) RunCycleResult
+  +run_loop(prompt, model, log_dir, enable_tracing, ...) None
   +_collect_input_snapshot() dict
+  +_build_effective_prompt(user_prompt, snapshot, short_memory) str
   +main() None
+}
+}
+
+package "agent_trade_sdk.memory_architecture" {
+class TradingDecisionBlock {
+  +action: BUY|SELL|SHORT|CLOSE|NO_TRADE
+  +symbol: str | None
+  +confidence: str | None
+  +rationale: str
+  +signal_principal: str | None
+  +risk_identified: str | None
+  +invalidation_condition: str | None
+  +executed_order: dict | None
+}
+
+class LongMemoryUpdateIntent {
+  +should_update_behavior: bool
+  +why: str
+  +update_summary: list[str]
+  +updated_behavior_markdown: str | None
+}
+
+class TradingSessionLLMOutput {
+  +trading_decision: TradingDecisionBlock
+  +session_summary: str
+  +decision_report: str
+  +self_critique: str
+  +pitfalls_to_avoid_next_run: list[str]
+  +next_session_directives: list[str]
+  +open_questions: list[str]
+  +long_memory_update_intent: LongMemoryUpdateIntent
+}
+
+class ShortMemoryRecord {
+  +generated_at_utc: str
+  +source_session_id: str
+  +model_name: str
+  +session_summary: str
+  +decision_report: str
+  +self_critique: str
+}
+
+class BehaviorHistoryResult {
+  +updated: bool
+  +before_path: Path | None
+  +after_path: Path | None
+  +diff_path: Path | None
+  +reason: str
+  +summary: list[str]
+}
+
+class MemoryApplyResult {
+  +parsed_output: TradingSessionLLMOutput | None
+  +short_memory_latest_path: Path | None
+  +short_memory_archive_path: Path | None
+  +behavior_history: BehaviorHistoryResult | None
+  +parse_error: str | None
+  +summary_for_log() dict
+}
+
+class MemoryArchitecture <<module>> {
+  +load_short_memory_latest() dict | None
+  +load_behavior_text() str
+  +parse_llm_trading_session_output(raw_text) TradingSessionLLMOutput
+  +apply_memory_outputs(raw_final_output, session_id, model_name, logs_root) MemoryApplyResult
+  +short_memory_prompt_block(short_memory) str
 }
 }
 
 package "agent_trade_sdk.session_log" {
 class SessionMarkdownLogger {
   +log_input_snapshot(snapshot) None
+  +log_short_memory_input(short_memory) None
+  +log_behavior_input(behavior_path, behavior_text) None
   +log_stream_event(event) None
   +log_final_output(output) None
+  +log_memory_apply_result(payload) None
+  +build_runtime_summary() dict
   +log_error(error) None
 }
+}
+
+package "agent_trade_sdk.tracing_support" {
+class TracingSupport <<module>> {
+  +build_agents_run_config(...) RunConfig
+  +build_trace_export_config(...) object
+}
+}
+
+package "Memory Files" {
+class "SOUL.md" as SoulFile <<artifact>>
+class "behavior.md" as BehaviorFile <<artifact>>
+class "memory/short/latest.json" as ShortMemoryFile <<artifact>>
+class "logs/behaviors/*.md|*.diff" as BehaviorHistoryFiles <<artifact>>
 }
 
 class Agent <<external>>
@@ -101,6 +200,8 @@ class OrderSide <<external>>
 class TimeInForce <<external>>
 class "agents.Runner" as AgentsRunner <<external>>
 class RunConfig <<external>>
+class "agents.tracing.trace" as AgentsTrace <<external>>
+class "agents.tracing.custom_span" as AgentsCustomSpan <<external>>
 class AgentUpdatedStreamEvent <<external>>
 class RawResponsesStreamEvent <<external>>
 class RunItemStreamEvent <<external>>
@@ -112,15 +213,22 @@ TradingAgentBuilder --> SearchTools
 TradingAgentBuilder --> MarketDataTools
 TradingAgentBuilder --> TradingTools
 TradingAgentBuilder --> Agent
+TradingAgentBuilder --> SoulFile
+TradingAgentBuilder --> BehaviorFile
 
 RunnerModule --> TradingAgentBuilder
 RunnerModule --> Settings
 RunnerModule --> SessionMarkdownLogger
+RunnerModule --> MemoryArchitecture
+RunnerModule --> MemoryApplyResult
 RunnerModule --> AlpacaPaperBroker
 RunnerModule --> SearchTools : tavily_search_raw
 RunnerModule --> MarketDataTools : yfinance_market_snapshot_raw
 RunnerModule --> AgentsRunner
-RunnerModule --> RunConfig
+RunnerModule --> TracingSupport
+RunnerModule --> AgentsTrace
+RunnerModule --> AgentsCustomSpan
+RunnerModule --> RunCycleResult
 
 SearchTools --> Settings
 SearchTools --> TavilyClient
@@ -137,5 +245,15 @@ AlpacaPaperBroker --> TimeInForce
 SessionMarkdownLogger --> AgentUpdatedStreamEvent
 SessionMarkdownLogger --> RawResponsesStreamEvent
 SessionMarkdownLogger --> RunItemStreamEvent
+
+MemoryArchitecture --> TradingSessionLLMOutput
+TradingSessionLLMOutput *-- TradingDecisionBlock
+TradingSessionLLMOutput *-- LongMemoryUpdateIntent
+MemoryArchitecture --> ShortMemoryRecord
+MemoryArchitecture --> MemoryApplyResult
+MemoryApplyResult *-- BehaviorHistoryResult
+MemoryArchitecture --> BehaviorFile
+MemoryArchitecture --> ShortMemoryFile
+MemoryArchitecture --> BehaviorHistoryFiles
 
 @enduml

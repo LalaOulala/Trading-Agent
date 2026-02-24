@@ -147,6 +147,22 @@ class SessionMarkdownLogger:
         self._append("## Input Snapshot\n\n")
         self._append(f"```json\n{_safe_dump(snapshot)}\n```\n\n")
 
+    def log_short_memory_input(self, short_memory: dict[str, Any] | None) -> None:
+        self._append("## Short Memory Input\n\n")
+        if not short_memory:
+            self._append("_None (first run or unavailable)_\n\n")
+            return
+        self._append(f"```json\n{_safe_dump(short_memory, max_chars=12000)}\n```\n\n")
+
+    def log_behavior_input(self, behavior_path: Path, behavior_text: str) -> None:
+        self._append("## Behavior Input\n\n")
+        self._append(f"- behavior_file: `{behavior_path}`\n\n")
+        self._append(f"```markdown\n{behavior_text}\n```\n\n")
+
+    def log_memory_apply_result(self, payload: dict[str, Any]) -> None:
+        self._append("## Memory Persistence\n\n")
+        self._append(f"```json\n{_safe_dump(payload, max_chars=12000)}\n```\n\n")
+
     def log_separator_new_snapshot(self, source_tool: str) -> None:
         now_utc = _utc_now().isoformat()
         self._append(
