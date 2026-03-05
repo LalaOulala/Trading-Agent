@@ -209,6 +209,16 @@ def list_open_positions() -> str:
 
 
 @function_tool
+def get_market_clock_snapshot() -> str:
+    """Return US market clock state (open/close timestamps) from Alpaca paper API."""
+
+    broker = AlpacaPaperBroker()
+    payload = broker.get_market_clock()
+    payload["source"] = "alpaca_tool"
+    return json.dumps(payload, ensure_ascii=False)
+
+
+@function_tool
 def place_market_order(
     symbol: str,
     side: OrderSideLiteral,

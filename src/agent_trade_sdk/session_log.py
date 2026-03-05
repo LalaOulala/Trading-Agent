@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from agents.tracing import custom_span, get_current_trace
 from agents.stream_events import AgentUpdatedStreamEvent, RawResponsesStreamEvent, RunItemStreamEvent
 
 
@@ -56,6 +57,62 @@ def _to_mapping(raw_item: Any) -> dict[str, Any]:
         except Exception:
             pass
     return {"value": str(raw_item)}
+
+
+def _parse_json_if_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    try:
+        return json.loads(text)
+    except Exception:
+        return value
+
+
+def _compact_tavily_call_for_trace(arguments: Any) -> dict[str, Any] | None:
+    parsed = _parse_json_if_string(arguments)
+    if not isinstance(parsed, dict):
+        return None
+    return {
+        "query": parsed.get("query"),
+        "max_results": parsed.get("max_results"),
+        "topic": parsed.get("topic"),
+        "time_range": parsed.get("time_range"),
+    }
+
+
+def _compact_tavily_output_for_trace(output: Any, *, max_results: int = 4) -> dict[str, Any] | None:
+    parsed = _parse_json_if_string(output)
+    if not isinstance(parsed, dict):
+        return None
+    raw_results = parsed.get("results")
+    compact_results: list[dict[str, Any]] = []
+    if isinstance(raw_results, list):
+        for item in raw_results[:max_results]:
+            if not isinstance(item, dict):
+                continue
+            compact_results.append(
+                {
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "published_date": item.get("published_date"),
+                    "score": item.get("score"),
+                }
+            )
+    answer = parsed.get("answer")
+    answer_excerpt = (
+        _truncate_text(answer, max_chars=400)
+        if isinstance(answer, str) and answer.strip()
+        else None
+    )
+    return {
+        "query": parsed.get("query"),
+        "results_count": len(raw_results) if isinstance(raw_results, list) else 0,
+        "answer_excerpt": answer_excerpt,
+        "top_results": compact_results,
+    }
 
 
 def _extract_message_text(raw: dict[str, Any]) -> str:
@@ -112,6 +169,12 @@ class SessionMarkdownLogger:
     _tool_outputs_summary: list[dict[str, Any]] = field(default_factory=list, init=False)
     _reasoning_summaries: list[str] = field(default_factory=list, init=False)
     _message_outputs: list[str] = field(default_factory=list, init=False)
+    _call_id_to_tavily_query: dict[str, str] = field(default_factory=dict, init=False)
+    _recent_tavily_calls: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _recent_tavily_findings: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _pre_run_source_quality: dict[str, Any] = field(default_factory=dict, init=False)
+    _pre_run_perplexity_context: dict[str, Any] = field(default_factory=dict, init=False)
+    _reflection_input: dict[str, Any] = field(default_factory=dict, init=False)
 
     _alpaca_order_tools: set[str] = field(
         default_factory=lambda: {"place_market_order", "open_short_position", "close_open_position"},
@@ -128,6 +191,65 @@ class SessionMarkdownLogger:
     def _append(self, text: str) -> None:
         with self.file_path.open("a", encoding="utf-8") as f:
             f.write(text)
+
+    def _emit_trace_span(self, name: str, data: dict[str, Any]) -> None:
+        if not self.tracing_enabled:
+            return
+        if get_current_trace() is None:
+            return
+        with custom_span(name, data=data, disabled=False):
+            pass
+
+    @staticmethod
+    def _append_with_limit(container: list[dict[str, Any]], value: dict[str, Any], *, limit: int = 5) -> None:
+        container.append(value)
+        if len(container) > limit:
+            del container[:-limit]
+
+    def _compact_tavily_context_for_trace(self) -> dict[str, Any]:
+        if not self._recent_tavily_calls and not self._recent_tavily_findings:
+            return {}
+
+        recent_calls = [
+            {
+                "query": item.get("query"),
+                "topic": item.get("topic"),
+                "time_range": item.get("time_range"),
+            }
+            for item in self._recent_tavily_calls[-3:]
+        ]
+        recent_findings = [
+            {
+                "query": item.get("query"),
+                "results_count": item.get("results_count"),
+                "top_titles": [
+                    result.get("title")
+                    for result in (item.get("top_results") or [])[:2]
+                    if isinstance(result, dict) and result.get("title")
+                ],
+            }
+            for item in self._recent_tavily_findings[-2:]
+        ]
+        return {
+            "recent_calls": recent_calls,
+            "recent_findings": recent_findings,
+        }
+
+    def _compact_source_context_for_trace(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "tavily_runtime_context": self._compact_tavily_context_for_trace(),
+        }
+        if self._pre_run_source_quality:
+            payload["pre_run_source_quality"] = self._pre_run_source_quality
+        if self._pre_run_perplexity_context:
+            payload["pre_run_perplexity"] = self._pre_run_perplexity_context
+        if self._reflection_input:
+            payload["reflection_input"] = {
+                "strategy_health_score": self._reflection_input.get("strategy_health_score"),
+                "stall_flags": self._reflection_input.get("stall_flags"),
+                "hard_rules_next_run": self._reflection_input.get("hard_rules_next_run"),
+            }
+        return payload
 
     def _write_header(self) -> None:
         utc_ts = _utc_now().isoformat()
@@ -146,6 +268,20 @@ class SessionMarkdownLogger:
     def log_input_snapshot(self, snapshot: dict[str, Any]) -> None:
         self._append("## Input Snapshot\n\n")
         self._append(f"```json\n{_safe_dump(snapshot)}\n```\n\n")
+        source_quality = snapshot.get("source_quality") if isinstance(snapshot, dict) else {}
+        self._pre_run_source_quality = source_quality if isinstance(source_quality, dict) else {}
+        perplexity = snapshot.get("perplexity_market_research") if isinstance(snapshot, dict) else {}
+        if isinstance(perplexity, dict):
+            search_results = perplexity.get("search_results")
+            citations = perplexity.get("citations")
+            self._pre_run_perplexity_context = {
+                "provider": perplexity.get("provider"),
+                "model": perplexity.get("model"),
+                "search_results_count": len(search_results) if isinstance(search_results, list) else 0,
+                "citations_count": len(citations) if isinstance(citations, list) else 0,
+            }
+        else:
+            self._pre_run_perplexity_context = {}
 
     def log_short_memory_input(self, short_memory: dict[str, Any] | None) -> None:
         self._append("## Short Memory Input\n\n")
@@ -153,6 +289,44 @@ class SessionMarkdownLogger:
             self._append("_None (first run or unavailable)_\n\n")
             return
         self._append(f"```json\n{_safe_dump(short_memory, max_chars=12000)}\n```\n\n")
+
+    def log_reflection_input(self, reflection: dict[str, Any] | None) -> None:
+        self._append("## Reflection Input\n\n")
+        if not reflection:
+            self._append("_None (reflection unavailable)_\n\n")
+            self._reflection_input = {}
+            return
+        self._reflection_input = reflection if isinstance(reflection, dict) else {}
+        self._append(f"```json\n{_safe_dump(reflection, max_chars=8000)}\n```\n\n")
+
+    def log_source_quality_assessment(self, source_quality: dict[str, Any] | None) -> None:
+        if not isinstance(source_quality, dict):
+            return
+        self._append("## Pourquoi Tavily/Perplexity Ont Été Jugés Utiles Ou Non\n\n")
+        for provider in ("tavily", "perplexity"):
+            payload = source_quality.get(provider)
+            if not isinstance(payload, dict):
+                continue
+            self._append(f"### {provider}\n\n")
+            self._append(
+                f"- usable_for_decision: `{str(bool(payload.get('usable_for_decision'))).lower()}`\n"
+            )
+            self._append(
+                f"- freshness_hours_median: `{payload.get('freshness_hours_median')}`\n"
+                f"- duplicate_ratio: `{payload.get('duplicate_ratio')}`\n"
+                f"- trusted_domain_ratio: `{payload.get('trusted_domain_ratio')}`\n"
+                f"- finance_relevance_score: `{payload.get('finance_relevance_score')}`\n"
+            )
+            diagnostics = payload.get("diagnostics")
+            if isinstance(diagnostics, list) and diagnostics:
+                self._append("- diagnostics:\n")
+                for item in diagnostics[:8]:
+                    self._append(f"  - {str(item)}\n")
+            self._append("\n")
+
+    def log_post_run_status(self, payload: dict[str, Any]) -> None:
+        self._append("## Post-Run Reflection Status\n\n")
+        self._append(f"```json\n{_safe_dump(payload, max_chars=6000)}\n```\n\n")
 
     def log_behavior_input(self, behavior_path: Path, behavior_text: str) -> None:
         self._append("## Behavior Input\n\n")
@@ -178,6 +352,14 @@ class SessionMarkdownLogger:
             return
 
         if isinstance(event, AgentUpdatedStreamEvent):
+            self._emit_trace_span(
+                "stream.agent_updated",
+                {
+                    "event_index": self.event_index,
+                    "time_utc": now_utc,
+                    "new_agent": event.new_agent.name,
+                },
+            )
             self._append(
                 f"### Event {self.event_index} - Agent Updated\n\n"
                 f"- time_utc: `{now_utc}`\n"
@@ -186,6 +368,14 @@ class SessionMarkdownLogger:
             return
 
         if not isinstance(event, RunItemStreamEvent):
+            self._emit_trace_span(
+                "stream.unknown_event",
+                {
+                    "event_index": self.event_index,
+                    "time_utc": now_utc,
+                    "event_type": type(event).__name__,
+                },
+            )
             self._append(
                 f"### Event {self.event_index} - Unknown Event\n\n"
                 f"- time_utc: `{now_utc}`\n"
@@ -222,9 +412,42 @@ class SessionMarkdownLogger:
                     else None,
                 }
             )
+            tavily_call = None
+            if tool_name == "web_search_tavily":
+                tavily_call = _compact_tavily_call_for_trace(arguments)
+                if isinstance(tavily_call, dict):
+                    self._append_with_limit(self._recent_tavily_calls, tavily_call, limit=6)
+                    query = tavily_call.get("query")
+                    if call_id and isinstance(query, str) and query.strip():
+                        self._call_id_to_tavily_query[call_id] = query.strip()
             if arguments:
                 self._append("\n**Tool arguments**\n\n")
                 self._append(f"```json\n{_safe_dump(arguments)}\n```\n")
+            self._emit_trace_span(
+                "stream.tool_called",
+                {
+                    "event_index": self.event_index,
+                    "time_utc": now_utc,
+                    "tool_name": tool_name,
+                    "call_id": call_id or None,
+                    "category": (
+                        "alpaca_order" if tool_name in self._alpaca_order_tools else None
+                    ),
+                    "arguments_excerpt": _truncate_text(_safe_dump(arguments, max_chars=1500))
+                    if arguments is not None
+                    else None,
+                },
+            )
+            if tavily_call:
+                self._emit_trace_span(
+                    "stream.tool_called.tavily",
+                    {
+                        "event_index": self.event_index,
+                        "time_utc": now_utc,
+                        "call_id": call_id or None,
+                        "tavily_call": tavily_call,
+                    },
+                )
 
         elif event.name == "tool_output":
             output_raw = _to_mapping(getattr(event.item, "raw_item", {}))
@@ -240,8 +463,18 @@ class SessionMarkdownLogger:
             if tool_name in self._alpaca_order_tools:
                 self._append("- category: `alpaca_order_execution`\n")
             output_value = getattr(event.item, "output", None)
-            output_excerpt = _truncate_text(_safe_dump(output_value, max_chars=1500))
+            output_excerpt_max_chars = 3500 if tool_name == "web_search_tavily" else 1500
+            output_excerpt = _truncate_text(_safe_dump(output_value, max_chars=output_excerpt_max_chars))
             is_error = "error" in output_excerpt.lower()
+            tavily_output = None
+            if tool_name == "web_search_tavily":
+                tavily_output = _compact_tavily_output_for_trace(output_value, max_results=5)
+                if isinstance(tavily_output, dict) and not tavily_output.get("query"):
+                    maybe_query = self._call_id_to_tavily_query.get(call_id)
+                    if maybe_query:
+                        tavily_output["query"] = maybe_query
+                if isinstance(tavily_output, dict):
+                    self._append_with_limit(self._recent_tavily_findings, tavily_output, limit=6)
             self._tool_outputs_summary.append(
                 {
                     "event_index": self.event_index,
@@ -256,19 +489,66 @@ class SessionMarkdownLogger:
                         else None
                     ),
                     "output_excerpt": output_excerpt,
+                    "tavily_summary": tavily_output if tool_name == "web_search_tavily" else None,
                 }
             )
             self._append("\n**Tool output**\n\n")
             self._append(f"```json\n{_safe_dump(output_value)}\n```\n")
+            self._emit_trace_span(
+                "stream.tool_output",
+                {
+                    "event_index": self.event_index,
+                    "time_utc": now_utc,
+                    "tool_name": tool_name,
+                    "call_id": call_id or None,
+                    "is_error": is_error,
+                    "category": (
+                        "snapshot_update"
+                        if tool_name in self._snapshot_tools
+                        else "alpaca_order_execution"
+                        if tool_name in self._alpaca_order_tools
+                        else None
+                    ),
+                    "output_excerpt": output_excerpt,
+                },
+            )
+            if tavily_output:
+                self._emit_trace_span(
+                    "stream.tool_output.tavily",
+                    {
+                        "event_index": self.event_index,
+                        "time_utc": now_utc,
+                        "call_id": call_id or None,
+                        "tavily_output": tavily_output,
+                    },
+                )
 
         elif event.name == "reasoning_item_created":
             summary = _extract_reasoning_summary(raw)
             if summary:
                 self._reasoning_summaries.append(_truncate_text(summary, max_chars=2000))
                 self._append(f"\n**Reasoning summary**\n\n{summary}\n")
+                self._emit_trace_span(
+                    "stream.reasoning_summary",
+                    {
+                        "event_index": self.event_index,
+                        "time_utc": now_utc,
+                        "summary_excerpt": _truncate_text(summary, max_chars=2500),
+                        "tavily_context": self._compact_tavily_context_for_trace(),
+                        "source_context": self._compact_source_context_for_trace(),
+                    },
+                )
             else:
                 self._append("\n**Reasoning raw item**\n\n")
                 self._append(f"```json\n{_safe_dump(raw)}\n```\n")
+                self._emit_trace_span(
+                    "stream.reasoning_raw",
+                    {
+                        "event_index": self.event_index,
+                        "time_utc": now_utc,
+                        "raw_excerpt": _truncate_text(_safe_dump(raw, max_chars=2500), max_chars=2500),
+                    },
+                )
 
         elif event.name == "message_output_created":
             text = _extract_message_text(raw)
@@ -276,12 +556,40 @@ class SessionMarkdownLogger:
                 self._message_outputs.append(_truncate_text(text, max_chars=3000))
                 self._append("\n**Message output**\n\n")
                 self._append(f"```text\n{text}\n```\n")
+                self._emit_trace_span(
+                    "stream.message_output",
+                    {
+                        "event_index": self.event_index,
+                        "time_utc": now_utc,
+                        "message_excerpt": _truncate_text(text, max_chars=3000),
+                        "tavily_context": self._compact_tavily_context_for_trace(),
+                        "source_context": self._compact_source_context_for_trace(),
+                    },
+                )
             else:
                 self._append("\n**Message raw item**\n\n")
                 self._append(f"```json\n{_safe_dump(raw)}\n```\n")
+                self._emit_trace_span(
+                    "stream.message_raw",
+                    {
+                        "event_index": self.event_index,
+                        "time_utc": now_utc,
+                        "raw_excerpt": _truncate_text(_safe_dump(raw, max_chars=2500), max_chars=2500),
+                    },
+                )
         else:
             self._append("\n**Event raw item**\n\n")
             self._append(f"```json\n{_safe_dump(raw)}\n```\n")
+            self._emit_trace_span(
+                "stream.event_raw",
+                {
+                    "event_index": self.event_index,
+                    "time_utc": now_utc,
+                    "event_name": event.name,
+                    "item_type": item_type,
+                    "raw_excerpt": _truncate_text(_safe_dump(raw, max_chars=2500), max_chars=2500),
+                },
+            )
 
         self._append("\n")
 
@@ -294,6 +602,8 @@ class SessionMarkdownLogger:
             "tool_error_count": tool_error_count,
             "reasoning_summaries": self._reasoning_summaries[-10:],
             "message_outputs": self._message_outputs[-10:],
+            "source_quality_pre_run": self._pre_run_source_quality,
+            "reflection_input": self._reflection_input,
         }
 
     def log_final_output(self, output: str) -> None:

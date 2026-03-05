@@ -1,4 +1,4 @@
-# Architecture - Phase 1
+# Architecture
 
 ## Objectif
 
@@ -6,7 +6,8 @@ Construire un socle propre pour un agent autonome de trading simulé:
 - recherche d'information web/social
 - décision pilotée par LLM
 - exécution d'ordres en paper trading
-- boucle agentique extensible via un profil comportemental (`SOUL.md`)
+- boucle agentique extensible via un profil comportemental (`SOUL.md` + `behavior.md`)
+- introspection inter-session exploitable par le run suivant
 
 ## Stack retenue
 
@@ -16,49 +17,57 @@ Construire un socle propre pour un agent autonome de trading simulé:
 4. **Recherche web/social**: Tavily (phase 1), requêtes sociales via filtres de domaines
 5. **Execution trading**: `alpaca-py` (paper trading API)
 6. **Config**: `.env` + `python-dotenv`
-7. **Journal V1**: logs Markdown par session (`logs/session_*.md`)
+7. **Tracing**: OpenAI tracing spans (pré-run, tools, réflexion post-run)
+8. **Réflexion**: second agent post-run avec sortie structurée (`ReflectionConclusion`)
 
-## Pourquoi Tavily en phase 1
+## Philosophie agentique moderne
 
-- API simple et rapide à intégrer en tool.
-- Résultats déjà orientés "agent workflows" (résumés, URLs).
-- Permet de prototyper vite.
+- Boucle cible: `Observe -> Orient -> Decide -> Act -> Reflect`.
+- Séparer exécution et introspection pour éviter l’auto-ancrage.
+- Garder les garde-fous critiques en code déterministe.
+- Contraindre les tools avec schémas stricts et sorties fidèles.
+- Conserver une traçabilité de bout en bout: source -> interprétation -> décision.
 
-## Alternatives recherche (à évaluer en phase 2)
+## Boucle d’exécution
 
-1. **Exa**: bon pour recherche sémantique profonde.
-2. **SerpAPI / Brave Search API**: meilleur coverage moteur de recherche.
-3. **Providers sociaux dédiés**:
-   - X API (officielle)
-   - Reddit API
-   - StockTwits API
+1. Chargement mémoire:
+- `behavior.md` (long terme adaptatif)
+- `memory/reflection/latest.json` (conclusion inter-session prioritaire)
+- fallback compact depuis `memory/short/latest.json`
 
-Stratégie recommandée: Tavily en fallback + connecteurs natifs par réseau social pour fiabilité.
+2. Snapshot pré-run:
+- horloge marché (`market_clock`)
+- portfolio Alpaca
+- market snapshot yfinance
+- news Tavily
+- recherche Perplexity
 
-## Structure de code
+3. Évaluation de qualité des sources:
+- `SourceQualityReport` pour Tavily et Perplexity
+- métriques: fraîcheur, duplicats, domaines fiables, pertinence finance
 
-```text
-agent_trade_sdk/
-├── .env.example
-├── SOUL.md
-├── docs/
-│   ├── architecture.md
-│   └── diagrams/
-│       └── trading_agent_class_diagram.puml
-├── scripts/
-│   ├── test_alpaca_order.py
-│   ├── test_tavily_search.py
-│   └── test_yfinance_market.py
-└── src/
-    └── agent_trade_sdk/
-        ├── agent.py
-        ├── config.py
-        ├── runner.py
-        └── tools/
-            ├── market_data.py
-            ├── search.py
-            └── trading.py
-```
+4. Guardrails anti-inaction:
+- détection deterministic (`stall_score`) sur historique de runs
+- règles correctrices injectées avant décision
+
+5. Exécution agent principal:
+- tools de marché/recherche/trading
+- sortie JSON stricte (décision + mémoire forensic)
+
+6. Réflexion post-run:
+- journal markdown inter-session (`logs/journals/`)
+- conclusion structurée (`memory/reflection/latest.json`)
+- mise à jour optionnelle de `behavior.md` uniquement
+- `SOUL.md` reste immuable
+
+## Modules clés
+
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/runner.py`
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/post_run_memory.py`
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/reflection_memory.py`
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/source_quality.py`
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/strategy_guardrails.py`
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/session_log.py`
 
 ## Format des tools (OpenAI Agents SDK)
 
@@ -82,12 +91,10 @@ def place_market_order(
     """Submit an Alpaca paper market order."""
 ```
 
-## Flux cible (phase 1)
+## Tracing
 
-1. Prompt utilisateur
-2. Agent planifie l'enquête
-3. Tools Yahoo Finance (snapshot/quote/historique)
-4. Tool Tavily web/social
-5. Synthèse + décision
-6. Tool Alpaca (paper order)
-7. Logging de la décision et de l'exécution
+- Les spans couvrent:
+- pré-run (sources, qualité, guardrails)
+- exécution runtime (tool calls, outputs, reasoning/message summaries)
+- attribution source dans la décision finale
+- réflexion post-run (journal, conclusion, update behavior)

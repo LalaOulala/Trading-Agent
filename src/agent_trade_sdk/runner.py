@@ -11,7 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from agents import Runner
-from agents.tracing import custom_span, trace as sdk_trace
+from agents.tracing import custom_span, get_current_trace, trace as sdk_trace
 
 from agent_trade_sdk.agent import build_trading_agent
 from agent_trade_sdk.config import Settings
@@ -21,9 +21,17 @@ from agent_trade_sdk.memory_architecture import (
     apply_memory_outputs,
     load_behavior_text,
     load_short_memory_latest,
-    short_memory_prompt_block,
+)
+from agent_trade_sdk.post_run_memory import PostRunMemoryResult, run_post_run_memory_cycle
+from agent_trade_sdk.reflection_memory import (
+    build_fallback_reflection_from_short_memory,
+    compact_reflection_for_trace,
+    load_reflection_latest,
+    reflection_prompt_block,
 )
 from agent_trade_sdk.session_log import SessionMarkdownLogger
+from agent_trade_sdk.source_quality import evaluate_snapshot_source_quality
+from agent_trade_sdk.strategy_guardrails import compact_stall_for_trace, compute_stall_guardrails
 from agent_trade_sdk.tracing_support import build_agents_run_config, build_trace_export_config
 from agent_trade_sdk.tools.market_data import yfinance_market_snapshot_raw
 from agent_trade_sdk.tools.perplexity_snapshot import (
@@ -47,7 +55,10 @@ class RunCycleResult:
     bootstrap_context: dict[str, Any]
     runtime_summary: dict[str, Any]
     short_memory_input: dict[str, Any] | None
+    reflection_input: dict[str, Any] | None
     memory_apply_result: MemoryApplyResult
+    post_run_memory_result: PostRunMemoryResult | None
+    post_run_memory_error: str | None
 
 
 def _json_dumps_compact(data: Any) -> str:
@@ -62,18 +73,127 @@ def _sessions_log_dir(log_dir: str | Path) -> Path:
     return _logs_root_path(log_dir) / "sessions"
 
 
-def _collect_input_snapshot() -> dict[str, Any]:
+def _trace_custom_span_if_active(
+    name: str,
+    *,
+    data: dict[str, Any],
+    enable_tracing: bool,
+) -> None:
+    if not enable_tracing:
+        return
+    if get_current_trace() is None:
+        return
+    with custom_span(name, data=data, disabled=False):
+        pass
+
+
+def _compact_account_for_trace(account: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(account, dict):
+        return {}
+    return {
+        "buying_power": account.get("buying_power"),
+        "equity": account.get("equity"),
+        "cash": account.get("cash"),
+        "portfolio_value": account.get("portfolio_value"),
+        "status": account.get("status"),
+    }
+
+
+def _compact_source_quality_for_trace(source_quality: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(source_quality, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for provider in ("tavily", "perplexity"):
+        payload = source_quality.get(provider)
+        if not isinstance(payload, dict):
+            continue
+        compact[provider] = {
+            "usable_for_decision": payload.get("usable_for_decision"),
+            "freshness_hours_median": payload.get("freshness_hours_median"),
+            "duplicate_ratio": payload.get("duplicate_ratio"),
+            "trusted_domain_ratio": payload.get("trusted_domain_ratio"),
+            "finance_relevance_score": payload.get("finance_relevance_score"),
+            "diagnostics": payload.get("diagnostics"),
+        }
+    return compact
+
+
+def _build_decision_source_attribution(
+    *,
+    runtime_summary: dict[str, Any],
+    snapshot: dict[str, Any],
+    final_output: str,
+) -> dict[str, Any]:
+    tool_calls = runtime_summary.get("tool_calls") if isinstance(runtime_summary, dict) else []
+    tavily_runtime_calls = 0
+    if isinstance(tool_calls, list):
+        tavily_runtime_calls = sum(
+            1
+            for item in tool_calls
+            if isinstance(item, dict) and str(item.get("tool_name")) == "web_search_tavily"
+        )
+    lower_output = final_output.lower()
+    news_block = snapshot.get("news") if isinstance(snapshot, dict) else {}
+    if not isinstance(news_block, dict):
+        news_block = {}
+    perplexity_block = (
+        snapshot.get("perplexity_market_research")
+        if isinstance(snapshot, dict)
+        else {}
+    )
+    return {
+        "pre_run_tavily_available": bool(news_block.get("results")),
+        "pre_run_perplexity_available": bool(
+            isinstance(perplexity_block, dict) and perplexity_block
+        ),
+        "runtime_tavily_tool_calls": tavily_runtime_calls,
+        "decision_mentions_tavily": "tavily" in lower_output or "web_search" in lower_output,
+        "decision_mentions_perplexity": "perplexity" in lower_output,
+        "source_quality": _compact_source_quality_for_trace(snapshot.get("source_quality")),
+    }
+
+
+def _collect_input_snapshot(enable_tracing: bool = False) -> dict[str, Any]:
     settings = Settings.from_env(require_openrouter=False)
     snapshot: dict[str, Any] = {
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "market_clock": {},
         "portfolio": {},
         "market": {},
         "news": {},
         "perplexity_market_research": {},
+        "source_quality": {},
+        "strategy_guardrails": {},
         "errors": [],
     }
 
     portfolio_symbols: list[str] = []
+    _trace_custom_span_if_active(
+        "pre_run.snapshot_collection_started",
+        data={"captured_at_utc": snapshot["captured_at_utc"]},
+        enable_tracing=enable_tracing,
+    )
+    try:
+        clock_payload = _get_us_market_clock()
+        snapshot["market_clock"] = clock_payload
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.market_clock",
+            data={
+                "status": "ok",
+                "market_clock": clock_payload,
+            },
+            enable_tracing=enable_tracing,
+        )
+    except Exception as exc:
+        snapshot["errors"].append({"source": "market_clock", "error": str(exc)})
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.market_clock",
+            data={
+                "status": "error",
+                "error": str(exc),
+            },
+            enable_tracing=enable_tracing,
+        )
     try:
         broker = AlpacaPaperBroker()
         account = broker.get_account()
@@ -84,8 +204,26 @@ def _collect_input_snapshot() -> dict[str, Any]:
             "positions": positions,
             "positions_count": len(positions),
         }
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.alpaca_portfolio",
+            data={
+                "status": "ok",
+                "positions_count": len(positions),
+                "symbols": portfolio_symbols[:20],
+                "account": _compact_account_for_trace(account),
+            },
+            enable_tracing=enable_tracing,
+        )
     except Exception as exc:
         snapshot["errors"].append({"source": "alpaca_portfolio", "error": str(exc)})
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.alpaca_portfolio",
+            data={
+                "status": "error",
+                "error": str(exc),
+            },
+            enable_tracing=enable_tracing,
+        )
 
     try:
         symbols = ["SPY", "QQQ", "IWM", "DIA"]
@@ -93,11 +231,38 @@ def _collect_input_snapshot() -> dict[str, Any]:
             if symbol not in symbols:
                 symbols.append(symbol)
         snapshot["market"] = yfinance_market_snapshot_raw(symbols_csv=",".join(symbols))
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.yfinance_market",
+            data={
+                "status": "ok",
+                "requested_symbols": symbols,
+                "market": _compact_market_for_prompt(snapshot["market"]),
+            },
+            enable_tracing=enable_tracing,
+        )
     except Exception as exc:
         snapshot["errors"].append({"source": "yfinance_market_snapshot", "error": str(exc)})
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.yfinance_market",
+            data={
+                "status": "error",
+                "error": str(exc),
+            },
+            enable_tracing=enable_tracing,
+        )
 
     try:
         if settings.tavily_api_key:
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.tavily_news.call",
+                data={
+                    "query": "US stock market today key drivers and catalysts",
+                    "max_results": 6,
+                    "topic": "news",
+                    "time_range": "day",
+                },
+                enable_tracing=enable_tracing,
+            )
             news_payload = tavily_search_raw(
                 query="US stock market today key drivers and catalysts",
                 max_results=6,
@@ -120,22 +285,128 @@ def _collect_input_snapshot() -> dict[str, Any]:
                 "answer": news_payload.get("answer"),
                 "results": compact_news,
             }
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.tavily_news.output",
+                data={
+                    "status": "ok",
+                    "results_count": len(compact_news),
+                    "answer_excerpt": (news_payload.get("answer") or "")[:400],
+                    "top_titles": [item.get("title") for item in compact_news[:3]],
+                },
+                enable_tracing=enable_tracing,
+            )
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.tavily_news",
+                data={
+                    "status": "ok",
+                    "news": _compact_news_for_prompt(snapshot["news"]),
+                    "answer_excerpt": (news_payload.get("answer") or "")[:400],
+                },
+                enable_tracing=enable_tracing,
+            )
         else:
             snapshot["errors"].append(
                 {"source": "tavily_market_news", "error": "Missing TAVILY_API_KEY"}
             )
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.tavily_news",
+                data={
+                    "status": "skipped",
+                    "reason": "Missing TAVILY_API_KEY",
+                },
+                enable_tracing=enable_tracing,
+            )
     except Exception as exc:
         snapshot["errors"].append({"source": "tavily_market_news", "error": str(exc)})
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.tavily_news",
+            data={
+                "status": "error",
+                "error": str(exc),
+            },
+            enable_tracing=enable_tracing,
+        )
 
     try:
         if settings.perplexity_api_key:
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.perplexity_market_research.call",
+                data={
+                    "provider": "perplexity",
+                    "model": settings.perplexity_model,
+                    "search_recency_filter": settings.perplexity_snapshot_search_recency,
+                },
+                enable_tracing=enable_tracing,
+            )
             snapshot["perplexity_market_research"] = perplexity_market_snapshot_raw()
+            perplexity_block = snapshot.get("perplexity_market_research") or {}
+            compact_perplexity = (
+                compact_perplexity_snapshot_for_prompt(perplexity_block)
+                if isinstance(perplexity_block, dict)
+                else {}
+            )
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.perplexity_market_research.output",
+                data={
+                    "status": "ok",
+                    "provider": "perplexity",
+                    "citations_count": len(perplexity_block.get("citations") or [])
+                    if isinstance(perplexity_block, dict)
+                    else 0,
+                    "search_results_count": len(perplexity_block.get("search_results") or [])
+                    if isinstance(perplexity_block, dict)
+                    else 0,
+                    "snapshot": compact_perplexity,
+                },
+                enable_tracing=enable_tracing,
+            )
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.perplexity_market_research",
+                data={
+                    "status": "ok",
+                    "perplexity_market_research": compact_perplexity,
+                },
+                enable_tracing=enable_tracing,
+            )
         else:
             snapshot["errors"].append(
                 {"source": "perplexity_market_snapshot", "error": "Missing PERPLEXITY_API_KEY"}
             )
+            _trace_custom_span_if_active(
+                "pre_run.snapshot_source.perplexity_market_research",
+                data={
+                    "status": "skipped",
+                    "reason": "Missing PERPLEXITY_API_KEY",
+                },
+                enable_tracing=enable_tracing,
+            )
     except Exception as exc:
         snapshot["errors"].append({"source": "perplexity_market_snapshot", "error": str(exc)})
+        _trace_custom_span_if_active(
+            "pre_run.snapshot_source.perplexity_market_research",
+            data={
+                "status": "error",
+                "error": str(exc),
+            },
+            enable_tracing=enable_tracing,
+        )
+
+    snapshot["source_quality"] = evaluate_snapshot_source_quality(snapshot)
+    _trace_custom_span_if_active(
+        "pre_run.snapshot_source_quality",
+        data={"source_quality": _compact_source_quality_for_trace(snapshot.get("source_quality"))},
+        enable_tracing=enable_tracing,
+    )
+
+    _trace_custom_span_if_active(
+        "pre_run.snapshot_collection_summary",
+        data={
+            "captured_at_utc": snapshot.get("captured_at_utc"),
+            "bootstrap_context": _build_agent_bootstrap_context(snapshot),
+            "errors": snapshot.get("errors") or [],
+        },
+        enable_tracing=enable_tracing,
+    )
 
     return snapshot
 
@@ -230,9 +501,12 @@ def _compact_portfolio_for_prompt(portfolio: dict[str, Any]) -> dict[str, Any]:
 def _build_agent_bootstrap_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     context: dict[str, Any] = {
         "captured_at_utc": snapshot.get("captured_at_utc"),
+        "market_clock": snapshot.get("market_clock") or {},
         "portfolio": _compact_portfolio_for_prompt(snapshot.get("portfolio") or {}),
         "market": _compact_market_for_prompt(snapshot.get("market") or {}),
         "news": _compact_news_for_prompt(snapshot.get("news") or {}),
+        "source_quality": _compact_source_quality_for_trace(snapshot.get("source_quality")),
+        "strategy_guardrails": snapshot.get("strategy_guardrails") or {},
         "errors": snapshot.get("errors") or [],
     }
     perplexity_block = snapshot.get("perplexity_market_research")
@@ -241,20 +515,49 @@ def _build_agent_bootstrap_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     return context
 
 
+def _short_memory_fallback_prompt(short_memory: dict[str, Any] | None) -> str:
+    if not isinstance(short_memory, dict):
+        return ""
+    summary = str(short_memory.get("session_summary") or "").strip()
+    report = str(short_memory.get("decision_report") or "").strip()
+    directives = short_memory.get("next_session_directives")
+    pitfalls = short_memory.get("pitfalls_to_avoid_next_run")
+
+    lines: list[str] = ["### Fallback mémoire courte (compacte)"]
+    if summary:
+        lines.append(f"- session_summary: {summary[:420]}")
+    if report:
+        lines.append(f"- decision_report: {report[:420]}")
+    if isinstance(pitfalls, list) and pitfalls:
+        lines.append("- pitfalls_to_avoid_next_run:")
+        for item in pitfalls[:3]:
+            lines.append(f"  - {str(item)[:180]}")
+    if isinstance(directives, list) and directives:
+        lines.append("- next_session_directives:")
+        for item in directives[:3]:
+            lines.append(f"  - {str(item)[:180]}")
+    return "\n".join(lines)[:1200] + "\n"
+
+
 def _build_effective_prompt(
     user_prompt: str,
     snapshot: dict[str, Any],
-    short_memory: dict[str, Any] | None = None,
+    reflection_memory: dict[str, Any] | None = None,
+    short_memory_fallback: dict[str, Any] | None = None,
 ) -> str:
     bootstrap_context = _build_agent_bootstrap_context(snapshot)
     return (
-        f"{short_memory_prompt_block(short_memory)}\n"
+        f"{reflection_prompt_block(reflection_memory, max_total_chars=3000)}\n"
+        f"{_short_memory_fallback_prompt(short_memory_fallback)}\n"
         "Contexte de pré-run (snapshot initial déjà collecté avant ton exécution):\n"
         "- Utilise ce snapshot comme point de départ.\n"
         "- Vérifie et approfondis avec les tools si les données sont ambiguës, incomplètes ou possiblement "
         "stales.\n"
         "- Tu peux enchaîner plusieurs recherches complémentaires (web, market data) avant de décider.\n"
         "- Le snapshot n'est pas une vérité absolue: recoupe les signaux avant de trader.\n\n"
+        "Exigence d'horloge marché:\n"
+        "- Avant toute conclusion pre-market/post-close, vérifie market_clock du snapshot ou appelle "
+        "get_market_clock_snapshot.\n\n"
         "### Snapshot initial (JSON)\n"
         f"```json\n{_json_dumps_compact(bootstrap_context)}\n```\n\n"
         "### Tâche utilisateur\n"
@@ -322,6 +625,44 @@ def _seconds_until_next_interval(interval_minutes: int) -> float:
     return max(1.0, next_ts - now_ts)
 
 
+def _build_cycle_trace(
+    *,
+    session_id: str,
+    model: str | None,
+    enable_tracing: bool,
+    loop: bool,
+    interval_minutes: int | None = None,
+    market_hours_only: bool | None = None,
+):
+    tracing_settings = Settings.from_env(require_openrouter=False) if enable_tracing else None
+    raw_metadata: dict[str, Any] = {
+        "component": "cycle",
+        "session_id": session_id,
+        "provider": "openrouter",
+        "model_override": model,
+        "loop": loop,
+    }
+    if interval_minutes is not None:
+        raw_metadata["interval_minutes"] = interval_minutes
+    if market_hours_only is not None:
+        raw_metadata["market_hours_only"] = market_hours_only
+    metadata: dict[str, str] = {
+        key: str(value)
+        for key, value in raw_metadata.items()
+        if value is not None
+    }
+    return sdk_trace(
+        "agent_trade_sdk.trading_cycle",
+        group_id=session_id,
+        metadata=metadata,
+        tracing=build_trace_export_config(
+            enable_tracing=enable_tracing,
+            settings=tracing_settings,
+        ),
+        disabled=not enable_tracing,
+    )
+
+
 async def run_once(
     prompt: str,
     model: str | None = None,
@@ -342,13 +683,81 @@ async def run_once(
     )
 
     short_memory = load_short_memory_latest()
+    reflection_memory = load_reflection_latest()
     behavior_text = load_behavior_text()
-    snapshot = _collect_input_snapshot()
+    _trace_custom_span_if_active(
+        "pre_run.memory_inputs_loaded",
+        data={
+            "short_memory_present": short_memory is not None,
+            "short_memory_keys": sorted(list((short_memory or {}).keys()))[:20],
+            "reflection_memory_present": reflection_memory is not None,
+            "reflection_memory_keys": sorted(list((reflection_memory or {}).keys()))[:20],
+            "behavior_path": str(BEHAVIOR_PATH),
+            "behavior_length_chars": len(behavior_text),
+        },
+        enable_tracing=enable_tracing,
+    )
+    snapshot = _collect_input_snapshot(enable_tracing=enable_tracing)
+    guardrails = compute_stall_guardrails(snapshot, lookback_runs=6).model_dump()
+    snapshot["strategy_guardrails"] = guardrails
+
+    fallback_reflection = (
+        reflection_memory
+        if isinstance(reflection_memory, dict)
+        else build_fallback_reflection_from_short_memory(short_memory, session_id=session_id)
+    )
+    if isinstance(fallback_reflection, dict) and isinstance(guardrails, dict):
+        existing_flags = fallback_reflection.get("stall_flags") or []
+        if isinstance(existing_flags, list):
+            merged_flags = [str(item) for item in existing_flags if str(item).strip()]
+        else:
+            merged_flags = []
+        for item in guardrails.get("stall_flags") or []:
+            text = str(item).strip()
+            if text and text not in merged_flags:
+                merged_flags.append(text)
+        fallback_reflection["stall_flags"] = merged_flags
+
+        existing_rules = fallback_reflection.get("hard_rules_next_run") or []
+        if isinstance(existing_rules, list):
+            merged_rules = [str(item) for item in existing_rules if str(item).strip()]
+        else:
+            merged_rules = []
+        for item in guardrails.get("hard_rules_next_run") or []:
+            text = str(item).strip()
+            if text and text not in merged_rules:
+                merged_rules.append(text)
+        fallback_reflection["hard_rules_next_run"] = merged_rules[:8]
+
+    _trace_custom_span_if_active(
+        "pre_run.strategy_guardrails",
+        data={"strategy_guardrails": compact_stall_for_trace(guardrails)},
+        enable_tracing=enable_tracing,
+    )
+
     logger.log_input_snapshot(snapshot)
     logger.log_short_memory_input(short_memory)
+    logger.log_reflection_input(fallback_reflection)
+    logger.log_source_quality_assessment(snapshot.get("source_quality"))
     logger.log_behavior_input(BEHAVIOR_PATH, behavior_text)
     bootstrap_context = _build_agent_bootstrap_context(snapshot)
-    effective_prompt = _build_effective_prompt(prompt, snapshot, short_memory=short_memory)
+    effective_prompt = _build_effective_prompt(
+        prompt,
+        snapshot,
+        reflection_memory=fallback_reflection,
+        short_memory_fallback=None if reflection_memory else short_memory,
+    )
+    _trace_custom_span_if_active(
+        "pre_run.prompt_built",
+        data={
+            "session_id": session_id,
+            "bootstrap_context": bootstrap_context,
+            "effective_prompt_length_chars": len(effective_prompt),
+            "reflection_context": compact_reflection_for_trace(fallback_reflection),
+            "strategy_guardrails": compact_stall_for_trace(guardrails),
+        },
+        enable_tracing=enable_tracing,
+    )
 
     run_config = build_agents_run_config(
         enable_tracing=enable_tracing,
@@ -370,11 +779,46 @@ async def run_once(
             logger.log_stream_event(event)
     except Exception as exc:
         logger.log_error(exc)
+        _trace_custom_span_if_active(
+            "run.main_run_error",
+            data={
+                "session_id": session_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            enable_tracing=enable_tracing,
+        )
         raise
 
     final_output = str(result.final_output)
     logger.log_final_output(final_output)
     runtime_summary = logger.build_runtime_summary()
+    _trace_custom_span_if_active(
+        "run.runtime_summary",
+        data={
+            "session_id": session_id,
+            "event_count": runtime_summary.get("event_count"),
+            "tool_error_count": runtime_summary.get("tool_error_count"),
+            "tool_calls": runtime_summary.get("tool_calls"),
+            "tool_outputs": runtime_summary.get("tool_outputs"),
+            "reasoning_summaries": runtime_summary.get("reasoning_summaries"),
+            "message_outputs": runtime_summary.get("message_outputs"),
+        },
+        enable_tracing=enable_tracing,
+    )
+    source_attribution = _build_decision_source_attribution(
+        runtime_summary=runtime_summary,
+        snapshot=snapshot,
+        final_output=final_output,
+    )
+    _trace_custom_span_if_active(
+        "run.decision.source_attribution",
+        data={
+            "session_id": session_id,
+            "source_attribution": source_attribution,
+        },
+        enable_tracing=enable_tracing,
+    )
     memory_apply_result = apply_memory_outputs(
         raw_final_output=final_output,
         session_id=session_id,
@@ -383,6 +827,66 @@ async def run_once(
         runtime_summary=runtime_summary,
     )
     logger.log_memory_apply_result(memory_apply_result.summary_for_log())
+    _trace_custom_span_if_active(
+        "run.memory_apply_outputs",
+        data={
+            "session_id": session_id,
+            "memory_apply_result": memory_apply_result.summary_for_log(),
+        },
+        enable_tracing=enable_tracing,
+    )
+    post_run_result: PostRunMemoryResult | None = None
+    post_run_error: str | None = None
+    try:
+        post_run_result = await run_post_run_memory_cycle(
+            session_id=session_id,
+            user_prompt=prompt,
+            model_name=model_name,
+            final_output=final_output,
+            bootstrap_context=bootstrap_context,
+            runtime_summary=runtime_summary,
+            session_log_path=logger.file_path,
+            logs_root=_logs_root_path(log_dir),
+            enable_tracing=enable_tracing,
+        )
+        logger.log_post_run_status(
+            {
+                "status": "ok",
+                "journal_file_path": str(post_run_result.journal_file_path),
+                "reflection_latest_path": str(post_run_result.reflection_latest_path),
+                "reflection_archive_path": str(post_run_result.reflection_archive_path),
+                "behavior_updated": post_run_result.behavior_updated,
+                "behavior_diff_path": str(post_run_result.behavior_diff_path)
+                if post_run_result.behavior_diff_path
+                else None,
+            }
+        )
+        _trace_custom_span_if_active(
+            "run.post_run_reflection",
+            data={
+                "session_id": session_id,
+                "journal_file_path": str(post_run_result.journal_file_path),
+                "reflection_latest_path": str(post_run_result.reflection_latest_path),
+                "reflection_archive_path": str(post_run_result.reflection_archive_path),
+                "behavior_updated": post_run_result.behavior_updated,
+                "behavior_diff_path": str(post_run_result.behavior_diff_path)
+                if post_run_result.behavior_diff_path
+                else None,
+            },
+            enable_tracing=enable_tracing,
+        )
+    except Exception as exc:
+        post_run_error = f"{type(exc).__name__}: {exc}"
+        logger.log_post_run_status({"status": "error", "error": post_run_error})
+        _trace_custom_span_if_active(
+            "run.post_run_reflection_error",
+            data={
+                "session_id": session_id,
+                "error": post_run_error,
+            },
+            enable_tracing=enable_tracing,
+        )
+
     return RunCycleResult(
         final_output=final_output,
         log_path=logger.file_path,
@@ -392,7 +896,10 @@ async def run_once(
         bootstrap_context=bootstrap_context,
         runtime_summary=runtime_summary,
         short_memory_input=short_memory,
+        reflection_input=fallback_reflection,
         memory_apply_result=memory_apply_result,
+        post_run_memory_result=post_run_result,
+        post_run_memory_error=post_run_error,
     )
 
 
@@ -421,24 +928,13 @@ async def run_loop(
 
         try:
             cycle_session_id = uuid.uuid4().hex[:8]
-            tracing_settings = Settings.from_env(require_openrouter=False) if enable_tracing else None
-            cycle_trace = sdk_trace(
-                "agent_trade_sdk.trading_cycle",
-                group_id=cycle_session_id,
-                metadata={
-                    "component": "cycle",
-                    "session_id": cycle_session_id,
-                    "provider": "openrouter",
-                    "model_override": model,
-                    "loop": True,
-                    "interval_minutes": interval_minutes,
-                    "market_hours_only": market_hours_only,
-                },
-                tracing=build_trace_export_config(
-                    enable_tracing=enable_tracing,
-                    settings=tracing_settings,
-                ),
-                disabled=not enable_tracing,
+            cycle_trace = _build_cycle_trace(
+                session_id=cycle_session_id,
+                model=model,
+                enable_tracing=enable_tracing,
+                loop=True,
+                interval_minutes=interval_minutes,
+                market_hours_only=market_hours_only,
             )
 
             with cycle_trace:
@@ -473,6 +969,15 @@ async def run_loop(
                         print(f"[memory-warning] {warning}")
                     if memory_info.get("behavior_diff_path"):
                         print(f"[memory] behavior_diff={memory_info['behavior_diff_path']}")
+                if cycle.post_run_memory_error:
+                    print(f"[post-run-reflection-error] {cycle.post_run_memory_error}")
+                elif cycle.post_run_memory_result:
+                    print(
+                        "[post-run-reflection] "
+                        f"journal={cycle.post_run_memory_result.journal_file_path} "
+                        f"reflection={cycle.post_run_memory_result.reflection_latest_path} "
+                        f"behavior_updated={cycle.post_run_memory_result.behavior_updated}"
+                    )
         except Exception as exc:
             print(f"[run-error] {type(exc).__name__}: {exc}")
 
@@ -533,14 +1038,39 @@ def main() -> None:
         )
         return
 
-    cycle = asyncio.run(
-        run_once(
-            prompt=args.prompt,
-            model=args.model,
-            log_dir=args.log_dir,
-            enable_tracing=args.enable_tracing,
-        )
+    cycle_session_id = uuid.uuid4().hex[:8]
+    cycle_trace = _build_cycle_trace(
+        session_id=cycle_session_id,
+        model=args.model,
+        enable_tracing=args.enable_tracing,
+        loop=False,
     )
+    with cycle_trace:
+        if args.enable_tracing:
+            with custom_span(
+                "cycle.main_run",
+                data={"session_id": cycle_session_id, "streaming": True},
+                disabled=False,
+            ):
+                cycle = asyncio.run(
+                    run_once(
+                        prompt=args.prompt,
+                        model=args.model,
+                        log_dir=args.log_dir,
+                        enable_tracing=args.enable_tracing,
+                        session_id=cycle_session_id,
+                    )
+                )
+        else:
+            cycle = asyncio.run(
+                run_once(
+                    prompt=args.prompt,
+                    model=args.model,
+                    log_dir=args.log_dir,
+                    enable_tracing=args.enable_tracing,
+                    session_id=cycle_session_id,
+                )
+            )
     print(cycle.final_output)
     print(f"\nSession log: {cycle.log_path}")
     memory_info = cycle.memory_apply_result.summary_for_log()
@@ -556,6 +1086,15 @@ def main() -> None:
             print(f"[memory-warning] {warning}")
         if memory_info.get("behavior_diff_path"):
             print(f"[memory] behavior_diff={memory_info['behavior_diff_path']}")
+    if cycle.post_run_memory_error:
+        print(f"[post-run-reflection-error] {cycle.post_run_memory_error}")
+    elif cycle.post_run_memory_result:
+        print(
+            "[post-run-reflection] "
+            f"journal={cycle.post_run_memory_result.journal_file_path} "
+            f"reflection={cycle.post_run_memory_result.reflection_latest_path} "
+            f"behavior_updated={cycle.post_run_memory_result.behavior_updated}"
+        )
 
 
 if __name__ == "__main__":

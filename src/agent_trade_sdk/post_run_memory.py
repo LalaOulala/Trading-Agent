@@ -11,8 +11,9 @@ from agents import Agent, ModelSettings, Runner
 from agents.extensions.models.litellm_model import LitellmModel
 from pydantic import BaseModel, Field
 
-from agent_trade_sdk.agent import SOUL_PATH
 from agent_trade_sdk.config import Settings
+from agent_trade_sdk.memory_architecture import BEHAVIOR_PATH
+from agent_trade_sdk.reflection_memory import ReflectionConclusion, write_reflection_conclusion
 from agent_trade_sdk.tracing_support import build_agents_run_config
 
 
@@ -36,29 +37,36 @@ def _truncate(value: str, max_chars: int = 12000) -> str:
     return value[:max_chars] + "\n... (truncated)"
 
 
+class BehaviorUpdateIntent(BaseModel):
+    should_update_behavior: bool
+    why: str = Field(..., description="Pourquoi mettre à jour (ou non) behavior.md.")
+    update_summary: list[str] = Field(default_factory=list)
+    updated_behavior_markdown: str | None = Field(
+        default=None,
+        description="Contenu complet de behavior.md si should_update_behavior=true, sinon null.",
+    )
+
+
 class PostRunMemoryOutput(BaseModel):
     journal_entry_markdown: str = Field(
         ...,
         description="Entrée markdown du journal personnel pour ce cycle (1 entrée complète).",
     )
-    updated_soul_markdown: str = Field(
-        ...,
-        description="Contenu COMPLET de SOUL.md après mise à jour (markdown complet).",
-    )
-    soul_update_summary: list[str] = Field(
-        default_factory=list,
-        description="Résumé court des changements apportés au SOUL.",
-    )
+    reflection_conclusion: ReflectionConclusion
+    behavior_update_intent: BehaviorUpdateIntent
 
 
 @dataclass(frozen=True)
 class PostRunMemoryResult:
     journal_file_path: Path
-    soul_file_path: Path
-    soul_history_before_path: Path
-    soul_history_after_path: Path
-    soul_diff_path: Path
-    soul_update_summary: list[str]
+    reflection_latest_path: Path
+    reflection_archive_path: Path
+    behavior_file_path: Path
+    behavior_history_before_path: Path | None
+    behavior_history_after_path: Path | None
+    behavior_diff_path: Path | None
+    behavior_updated: bool
+    behavior_update_summary: list[str]
 
 
 def _build_reflection_agent(model_name: str | None = None) -> Agent:
@@ -70,19 +78,21 @@ def _build_reflection_agent(model_name: str | None = None) -> Agent:
     )
 
     instructions = (
-        "Tu es le module de mémoire/réflexion d'un agent de trading paper autonome.\n"
-        "Ta mission: analyser un cycle de run terminé, écrire une entrée de journal utile pour debug "
-        "humain, puis réécrire complètement SOUL.md avec les apprentissages de process et de trading "
-        "observés sur ce cycle.\n"
-        "Tu peux modifier directement SOUL.md sans validation humaine. Garde un document cohérent et lisible.\n"
-        "Conserve un style concret, opérationnel, sans fluff. Retourne la sortie structurée demandée."
+        "Tu es le module de réflexion inter-session d'un agent de trading paper autonome.\n"
+        "Mission: analyser le cycle terminé, produire une introspection utile et exploitable pour le cycle suivant.\n"
+        "Contraintes non négociables:\n"
+        "- SOUL.md est immuable et ne doit jamais être modifié.\n"
+        "- Tu peux proposer une mise à jour de behavior.md uniquement si elle est utile et durable.\n"
+        "- Reste concret: faits, erreurs, blocages, actions correctrices.\n"
+        "- Si NO_TRADE se répète, explicite le risque d'inaction chronique et des règles correctrices.\n"
+        "- Retourne strictement le format structuré demandé."
     )
 
     return Agent(
-        name="TradingAgentMemoryWriter",
+        name="TradingAgentReflectionWriter",
         instructions=instructions,
         model=model,
-        model_settings=ModelSettings(include_usage=True),
+        model_settings=ModelSettings(include_usage=False),
         output_type=PostRunMemoryOutput,
     )
 
@@ -95,18 +105,21 @@ def _build_post_run_prompt(
     bootstrap_context: dict[str, Any],
     runtime_summary: dict[str, Any],
     session_log_path: Path,
-    current_soul: str,
+    current_behavior: str,
 ) -> str:
     return (
-        "Tu dois faire la sortie de boucle d'un run de trading.\n\n"
-        "Tâches obligatoires:\n"
-        "1) Écrire une entrée de journal personnel (Markdown) résumant ce cycle.\n"
-        "2) Réécrire ENTIEREMENT SOUL.md en intégrant ce que l'agent a appris pendant ce cycle.\n\n"
-        "Directives:\n"
-        "- Le journal doit être utile pour debug humain (faits, outils, erreurs, décision, exécution, leçons).\n"
-        "- Le SOUL mis à jour doit rester un contrat de comportement exploitable pour le prochain cycle.\n"
-        "- Tu peux changer librement le SOUL (expérience volontairement autonome), mais garde de la cohérence.\n"
-        "- N'inclus pas de backticks triples dans les champs texte si possible.\n\n"
+        "Tu dois produire la réflexion inter-session d'un run de trading.\n\n"
+        "Sortie obligatoire:\n"
+        "1) journal_entry_markdown: journal intime de trader (debuggable humainement).\n"
+        "2) reflection_conclusion: synthèse structurée pour injection dans le prochain prompt.\n"
+        "3) behavior_update_intent: proposition optionnelle de mise à jour de behavior.md.\n\n"
+        "Règles de qualité:\n"
+        "- Identifier ce qui a marché / échoué / bloqué.\n"
+        "- Évaluer le risque d'inaction chronique (NO_TRADE répété) sans forcer un trade aveugle.\n"
+        "- Définir hard_rules_next_run quand des blocages sont visibles.\n"
+        "- conclusion_for_prompt doit rester concise (<=1500 chars).\n"
+        "- should_update_behavior=true seulement si amélioration durable explicite.\n"
+        "- Si should_update_behavior=false, updated_behavior_markdown doit être null.\n\n"
         f"session_id: {session_id}\n"
         f"session_log_path: {session_log_path}\n\n"
         "=== USER PROMPT DU CYCLE ===\n"
@@ -117,8 +130,8 @@ def _build_post_run_prompt(
         f"{_safe_json(bootstrap_context, max_chars=24000)}\n\n"
         "=== RUNTIME SUMMARY (tools/reasoning/messages) ===\n"
         f"{_safe_json(runtime_summary, max_chars=28000)}\n\n"
-        "=== SOUL.md ACTUEL ===\n"
-        f"{_truncate(current_soul, 20000)}\n"
+        "=== behavior.md ACTUEL ===\n"
+        f"{_truncate(current_behavior, 22000)}\n"
     )
 
 
@@ -133,22 +146,29 @@ def _append_session_log_post_run(
     *,
     session_log_path: Path,
     journal_path: Path,
-    soul_update_summary: list[str],
-    soul_diff_path: Path,
+    reflection_latest_path: Path,
+    reflection_archive_path: Path,
+    behavior_updated: bool,
+    behavior_diff_path: Path | None,
+    behavior_update_summary: list[str],
 ) -> None:
     if not session_log_path.exists():
         return
     lines = [
-        "## Post-Run Memory\n",
+        "## Post-Run Reflection\n",
         "\n",
         f"- time_utc: `{_utc_now_iso()}`\n",
         f"- journal_entry_file: `{journal_path}`\n",
-        f"- soul_diff_file: `{soul_diff_path}`\n",
-        "\n",
+        f"- reflection_latest_file: `{reflection_latest_path}`\n",
+        f"- reflection_archive_file: `{reflection_archive_path}`\n",
+        f"- behavior_updated: `{str(behavior_updated).lower()}`\n",
     ]
-    if soul_update_summary:
-        lines.append("### SOUL Update Summary\n\n")
-        for item in soul_update_summary:
+    if behavior_diff_path:
+        lines.append(f"- behavior_diff_file: `{behavior_diff_path}`\n")
+    lines.append("\n")
+    if behavior_update_summary:
+        lines.append("### behavior.md Update Summary\n\n")
+        for item in behavior_update_summary:
             lines.append(f"- {item}\n")
         lines.append("\n")
     with session_log_path.open("a", encoding="utf-8") as fh:
@@ -166,7 +186,7 @@ def _append_journal_entry(
     day_file = journal_dir / f"journal_{now.strftime('%Y-%m-%d')}.md"
     journal_dir.mkdir(parents=True, exist_ok=True)
     header = (
-        f"\n\n---\n\n"
+        "\n\n---\n\n"
         f"## Run {now.strftime('%H:%M:%S')} UTC - session `{session_id}`\n\n"
         f"- session_log: `{session_log_path}`\n\n"
     )
@@ -176,36 +196,39 @@ def _append_journal_entry(
     return day_file
 
 
-def _write_soul_with_history(
+def _write_behavior_with_history(
     *,
-    soul_path: Path,
-    new_soul_text: str,
-    soul_history_dir: Path,
+    new_behavior_text: str,
+    behavior_history_dir: Path,
     session_id: str,
-) -> tuple[Path, Path, Path]:
-    before_text = soul_path.read_text(encoding="utf-8") if soul_path.exists() else ""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    soul_history_dir.mkdir(parents=True, exist_ok=True)
+) -> tuple[bool, Path | None, Path | None, Path | None]:
+    before_text = BEHAVIOR_PATH.read_text(encoding="utf-8") if BEHAVIOR_PATH.exists() else ""
+    normalized_new = new_behavior_text.rstrip() + "\n"
+    if before_text == normalized_new:
+        return False, None, None, None
 
-    before_path = soul_history_dir / f"SOUL_before_{timestamp}_{session_id}.md"
-    after_path = soul_history_dir / f"SOUL_after_{timestamp}_{session_id}.md"
-    diff_path = soul_history_dir / f"SOUL_diff_{timestamp}_{session_id}.diff"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    behavior_history_dir.mkdir(parents=True, exist_ok=True)
+
+    before_path = behavior_history_dir / f"behavior_before_{timestamp}_{session_id}.md"
+    after_path = behavior_history_dir / f"behavior_after_{timestamp}_{session_id}.md"
+    diff_path = behavior_history_dir / f"behavior_diff_{timestamp}_{session_id}.diff"
 
     before_path.write_text(before_text, encoding="utf-8")
-    _atomic_write_text(soul_path, new_soul_text.rstrip() + "\n")
-    after_text = soul_path.read_text(encoding="utf-8")
+    _atomic_write_text(BEHAVIOR_PATH, normalized_new)
+    after_text = BEHAVIOR_PATH.read_text(encoding="utf-8")
     after_path.write_text(after_text, encoding="utf-8")
 
     diff_text = "".join(
         difflib.unified_diff(
             before_text.splitlines(keepends=True),
             after_text.splitlines(keepends=True),
-            fromfile="SOUL_before.md",
-            tofile="SOUL_after.md",
+            fromfile="behavior_before.md",
+            tofile="behavior_after.md",
         )
     )
     diff_path.write_text(diff_text, encoding="utf-8")
-    return before_path, after_path, diff_path
+    return True, before_path, after_path, diff_path
 
 
 async def run_post_run_memory_cycle(
@@ -220,7 +243,7 @@ async def run_post_run_memory_cycle(
     logs_root: Path,
     enable_tracing: bool,
 ) -> PostRunMemoryResult:
-    current_soul = SOUL_PATH.read_text(encoding="utf-8") if SOUL_PATH.exists() else ""
+    current_behavior = BEHAVIOR_PATH.read_text(encoding="utf-8") if BEHAVIOR_PATH.exists() else ""
     reflection_agent = _build_reflection_agent(model_name=model_name)
     prompt = _build_post_run_prompt(
         session_id=session_id,
@@ -229,7 +252,7 @@ async def run_post_run_memory_cycle(
         bootstrap_context=bootstrap_context,
         runtime_summary=runtime_summary,
         session_log_path=session_log_path,
-        current_soul=current_soul,
+        current_behavior=current_behavior,
     )
 
     result = await Runner.run(
@@ -251,7 +274,6 @@ async def run_post_run_memory_cycle(
     )
     reflection_output = result.final_output
     if not isinstance(reflection_output, PostRunMemoryOutput):
-        # Defensive fallbacks for providers/models with different structured-output behavior.
         if isinstance(reflection_output, str):
             reflection_output = PostRunMemoryOutput.model_validate(json.loads(reflection_output))
         elif hasattr(reflection_output, "model_dump"):
@@ -265,24 +287,46 @@ async def run_post_run_memory_cycle(
         journal_entry_markdown=reflection_output.journal_entry_markdown,
         session_log_path=session_log_path,
     )
-    before_path, after_path, diff_path = _write_soul_with_history(
-        soul_path=SOUL_PATH,
-        new_soul_text=reflection_output.updated_soul_markdown,
-        soul_history_dir=logs_root / "souls",
+    reflection_latest_path, reflection_archive_path = write_reflection_conclusion(
+        conclusion=reflection_output.reflection_conclusion,
         session_id=session_id,
     )
+
+    behavior_intent = reflection_output.behavior_update_intent
+    behavior_updated = False
+    behavior_before_path: Path | None = None
+    behavior_after_path: Path | None = None
+    behavior_diff_path: Path | None = None
+    if behavior_intent.should_update_behavior and behavior_intent.updated_behavior_markdown:
+        (
+            behavior_updated,
+            behavior_before_path,
+            behavior_after_path,
+            behavior_diff_path,
+        ) = _write_behavior_with_history(
+            new_behavior_text=behavior_intent.updated_behavior_markdown,
+            behavior_history_dir=logs_root / "behaviors",
+            session_id=session_id,
+        )
+
     _append_session_log_post_run(
         session_log_path=session_log_path,
         journal_path=journal_path,
-        soul_update_summary=reflection_output.soul_update_summary,
-        soul_diff_path=diff_path,
+        reflection_latest_path=reflection_latest_path,
+        reflection_archive_path=reflection_archive_path,
+        behavior_updated=behavior_updated,
+        behavior_diff_path=behavior_diff_path,
+        behavior_update_summary=behavior_intent.update_summary,
     )
 
     return PostRunMemoryResult(
         journal_file_path=journal_path,
-        soul_file_path=SOUL_PATH,
-        soul_history_before_path=before_path,
-        soul_history_after_path=after_path,
-        soul_diff_path=diff_path,
-        soul_update_summary=reflection_output.soul_update_summary,
+        reflection_latest_path=reflection_latest_path,
+        reflection_archive_path=reflection_archive_path,
+        behavior_file_path=BEHAVIOR_PATH,
+        behavior_history_before_path=behavior_before_path,
+        behavior_history_after_path=behavior_after_path,
+        behavior_diff_path=behavior_diff_path,
+        behavior_updated=behavior_updated,
+        behavior_update_summary=behavior_intent.update_summary,
     )

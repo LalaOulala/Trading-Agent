@@ -15,6 +15,7 @@ from agent_trade_sdk.tools.search import web_search_tavily
 from agent_trade_sdk.tools.trading import (
     close_open_position,
     get_account_snapshot,
+    get_market_clock_snapshot,
     list_open_positions,
     open_short_position,
     place_market_order,
@@ -65,7 +66,8 @@ def build_trading_agent(model_name: str | None = None) -> Agent:
         "Workflow de session (obligatoire):\n"
         "1) Lire la mémoire courte précédente (si fournie) et identifier les pièges à éviter.\n"
         "2) Lire le snapshot de pré-run et formuler des lignes directrices pour ce cycle.\n"
-        "3) Vérifier/rafraîchir avec les tools les faits critiques avant toute décision.\n"
+        "3) Vérifier/rafraîchir avec les tools les faits critiques avant toute décision (incluant l'horloge marché "
+        "si contexte pre/post-market ambigu).\n"
         "4) Donner une intention claire avant chaque tool call (ce que tu cherches à vérifier/invalider).\n"
         "5) Décider une seule action de trading: BUY, SELL, SHORT, CLOSE ou NO_TRADE.\n"
         "6) Exécuter via tools Alpaca seulement si la conviction est suffisante et si les garde-fous sont "
@@ -106,14 +108,16 @@ def build_trading_agent(model_name: str | None = None) -> Agent:
         "}\n\n"
         "Si should_update_behavior=false, updated_behavior_markdown doit être null.\n"
         "Si should_update_behavior=true, updated_behavior_markdown doit contenir le contenu COMPLET de "
-        "behavior.md (pas un patch)."
+        "behavior.md (pas un patch).\n"
+        "Important: la mise à jour effective de behavior.md est désormais gérée par le module de réflexion "
+        "post-run. Dans ce run principal, garde should_update_behavior=false sauf besoin exceptionnel."
     )
 
     return Agent(
         name="SimulatedTradingAgent",
         instructions=instructions,
         model=model,
-        model_settings=ModelSettings(include_usage=True),
+        model_settings=ModelSettings(include_usage=False),
         tools=[
             get_market_snapshot,
             get_market_quote,
@@ -121,6 +125,7 @@ def build_trading_agent(model_name: str | None = None) -> Agent:
             web_search_tavily,
             get_account_snapshot,
             list_open_positions,
+            get_market_clock_snapshot,
             place_market_order,
             open_short_position,
             close_open_position,

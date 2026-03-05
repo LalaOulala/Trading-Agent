@@ -493,30 +493,22 @@ def apply_memory_outputs(
     )
 
     behavior_intent = parsed.long_memory_update_intent
-    behavior_history: BehaviorHistoryResult
-    if behavior_intent.should_update_behavior and behavior_intent.updated_behavior_markdown:
-        behavior_history = _archive_behavior_update(
-            new_behavior_text=behavior_intent.updated_behavior_markdown,
-            logs_root=logs_root,
-            session_id=session_id,
-        )
-        # Preserve the LLM's summary in the result.
-        behavior_history = BehaviorHistoryResult(
-            updated=behavior_history.updated,
-            before_path=behavior_history.before_path,
-            after_path=behavior_history.after_path,
-            diff_path=behavior_history.diff_path,
-            reason=behavior_history.reason,
-            summary=behavior_intent.update_summary,
-        )
-    else:
-        behavior_history = BehaviorHistoryResult(
-            updated=False,
-            before_path=None,
-            after_path=None,
-            diff_path=None,
-            reason=behavior_intent.why,
-            summary=behavior_intent.update_summary,
+    behavior_history = BehaviorHistoryResult(
+        updated=False,
+        before_path=None,
+        after_path=None,
+        diff_path=None,
+        reason=(
+            "Behavior update handled by post-run reflection cycle."
+            if behavior_intent.should_update_behavior
+            else behavior_intent.why
+        ),
+        summary=behavior_intent.update_summary,
+    )
+    if behavior_intent.should_update_behavior:
+        _append_unique(
+            system_warnings,
+            "behavior.md update requested in main output but deferred to post-run reflection writer.",
         )
 
     return MemoryApplyResult(
