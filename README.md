@@ -122,7 +122,7 @@ On peut aussi forcer un autre fichier:
 python -m agent_trade_sdk.runner --loop --prompt-file /chemin/vers/mon_prompt.txt
 ```
 
-## Tracing OpenAI
+## Tracing OpenAI (à terminer)
 
 ```bash
 python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
