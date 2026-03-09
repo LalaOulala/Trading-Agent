@@ -116,7 +116,7 @@ Le mode loop peut démarrer sans `--prompt` si le fichier `prompts/default_loop_
 python -m agent_trade_sdk.runner --loop --interval-minutes 15 --enable-tracing
 ```
 
-Tu peux aussi forcer un autre fichier:
+On peut aussi forcer un autre fichier:
 
 ```bash
 python -m agent_trade_sdk.runner --loop --prompt-file /chemin/vers/mon_prompt.txt
@@ -144,7 +144,7 @@ PYTHONPATH=src .venv/bin/python -m pytest -q
 
 - Utilise uniquement des clés paper trading Alpaca.
 - Ce projet est éducatif. Aucune recommandation financière.
-- Mets des limites strictes dans `SOUL.md` + variables d'environnement (`TRADING_MAX_NOTIONAL_USD`, `TRADING_ALLOWED_SYMBOLS`).
+- Limites strictes dans `SOUL.md`.
 
 ## Fichiers importants
 
