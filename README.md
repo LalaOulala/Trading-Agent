@@ -34,6 +34,20 @@ pip install -e .
 
 Remplis ensuite `.env` avec tes clés.
 
+## Prompt par défaut (`prompts/`)
+
+Le runner peut lire un prompt depuis un fichier, pour éviter de le repasser à chaque lancement.
+
+- Fichier par défaut: `prompts/default_loop_prompt.txt`
+- Utilisé automatiquement si `--prompt` est omis
+- Surchargable via `--prompt-file`
+
+Exemple d'override:
+
+```bash
+python -m agent_trade_sdk.runner --prompt-file prompts/default_loop_prompt.txt
+```
+
 ## Tester Tavily
 
 ```bash
@@ -66,6 +80,16 @@ python scripts/test_alpaca_order.py --action close --symbol SPY
 python -m agent_trade_sdk.runner --prompt "Analyse AAPL et propose une action avec justification."
 ```
 
+Si `--prompt` est omis, le runner charge automatiquement:
+
+- `prompts/default_loop_prompt.txt`
+
+Exemple:
+
+```bash
+python -m agent_trade_sdk.runner
+```
+
 Le runner crée:
 - un log Markdown de session dans `logs/sessions/`
 - un journal inter-session dans `logs/journals/`
@@ -82,6 +106,20 @@ Pour réactiver explicitement le tracing SDK:
 
 ```bash
 python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
+```
+
+## Lancer en boucle sans repasser le prompt
+
+Le mode loop peut démarrer sans `--prompt` si le fichier `prompts/default_loop_prompt.txt` existe.
+
+```bash
+python -m agent_trade_sdk.runner --loop --interval-minutes 15 --enable-tracing
+```
+
+Tu peux aussi forcer un autre fichier:
+
+```bash
+python -m agent_trade_sdk.runner --loop --prompt-file /chemin/vers/mon_prompt.txt
 ```
 
 ## Tracing OpenAI

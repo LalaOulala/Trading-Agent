@@ -43,6 +43,8 @@ from agent_trade_sdk.tools.trading import AlpacaPaperBroker
 
 
 NY_TZ = ZoneInfo("America/New_York")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_PROMPT_FILE = ROOT_DIR / "prompts" / "default_loop_prompt.txt"
 
 
 @dataclass(frozen=True)
@@ -625,6 +627,34 @@ def _seconds_until_next_interval(interval_minutes: int) -> float:
     return max(1.0, next_ts - now_ts)
 
 
+def _resolve_prompt(
+    *,
+    prompt: str | None,
+    prompt_file: str | None,
+) -> tuple[str, Path | None]:
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip(), None
+
+    candidate = Path(prompt_file).expanduser() if prompt_file else DEFAULT_PROMPT_FILE
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve()
+
+    if not candidate.exists():
+        raise ValueError(
+            "No --prompt provided and prompt file was not found: "
+            f"{candidate}. Provide --prompt or create this file."
+        )
+
+    content = candidate.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValueError(
+            "Prompt file is empty: "
+            f"{candidate}. Add prompt content or provide --prompt."
+        )
+
+    return content, candidate
+
+
 def _build_cycle_trace(
     *,
     session_id: str,
@@ -988,7 +1018,19 @@ async def run_loop(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one prompt against the trading agent.")
-    parser.add_argument("--prompt", required=True, help="User prompt for the agent run.")
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="User prompt for the agent run. Optional if --prompt-file (or default prompt file) is available.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        default=None,
+        help=(
+            "Path to a text file containing the default prompt. "
+            "Used when --prompt is omitted. Defaults to prompts/default_loop_prompt.txt."
+        ),
+    )
     parser.add_argument("--model", default=None, help="Optional model override.")
     parser.add_argument(
         "--log-dir",
@@ -1024,10 +1066,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    try:
+        effective_prompt, loaded_prompt_path = _resolve_prompt(
+            prompt=args.prompt,
+            prompt_file=args.prompt_file,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+        return
+
+    if loaded_prompt_path is not None:
+        print(f"[prompt] loaded from {loaded_prompt_path}")
+
     if args.loop:
         asyncio.run(
             run_loop(
-                prompt=args.prompt,
+                prompt=effective_prompt,
                 model=args.model,
                 log_dir=args.log_dir,
                 enable_tracing=args.enable_tracing,
@@ -1054,7 +1108,7 @@ def main() -> None:
             ):
                 cycle = asyncio.run(
                     run_once(
-                        prompt=args.prompt,
+                        prompt=effective_prompt,
                         model=args.model,
                         log_dir=args.log_dir,
                         enable_tracing=args.enable_tracing,
@@ -1064,7 +1118,7 @@ def main() -> None:
         else:
             cycle = asyncio.run(
                 run_once(
-                    prompt=args.prompt,
+                    prompt=effective_prompt,
                     model=args.model,
                     log_dir=args.log_dir,
                     enable_tracing=args.enable_tracing,
