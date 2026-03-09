@@ -106,7 +106,19 @@ def _build_post_run_prompt(
     runtime_summary: dict[str, Any],
     session_log_path: Path,
     current_behavior: str,
+    main_output_parse_error: str | None,
+    allow_behavior_autowrite: bool,
 ) -> str:
+    parse_block = (
+        f"=== MAIN OUTPUT PARSE STATUS ===\ninvalid\nparse_error: {main_output_parse_error}\n\n"
+        if main_output_parse_error
+        else "=== MAIN OUTPUT PARSE STATUS ===\nvalid\n\n"
+    )
+    behavior_policy = (
+        "AUTORISATION ECRITURE behavior.md: ENABLED"
+        if allow_behavior_autowrite
+        else "AUTORISATION ECRITURE behavior.md: DISABLED (mettre should_update_behavior=false)."
+    )
     return (
         "Tu dois produire la réflexion inter-session d'un run de trading.\n\n"
         "Sortie obligatoire:\n"
@@ -120,8 +132,10 @@ def _build_post_run_prompt(
         "- conclusion_for_prompt doit rester concise (<=1500 chars).\n"
         "- should_update_behavior=true seulement si amélioration durable explicite.\n"
         "- Si should_update_behavior=false, updated_behavior_markdown doit être null.\n\n"
+        f"{behavior_policy}\n\n"
         f"session_id: {session_id}\n"
         f"session_log_path: {session_log_path}\n\n"
+        f"{parse_block}"
         "=== USER PROMPT DU CYCLE ===\n"
         f"{_truncate(user_prompt, 8000)}\n\n"
         "=== FINAL OUTPUT DU CYCLE ===\n"
@@ -242,6 +256,8 @@ async def run_post_run_memory_cycle(
     session_log_path: Path,
     logs_root: Path,
     enable_tracing: bool,
+    allow_behavior_autowrite: bool = False,
+    main_output_parse_error: str | None = None,
 ) -> PostRunMemoryResult:
     current_behavior = BEHAVIOR_PATH.read_text(encoding="utf-8") if BEHAVIOR_PATH.exists() else ""
     reflection_agent = _build_reflection_agent(model_name=model_name)
@@ -253,6 +269,8 @@ async def run_post_run_memory_cycle(
         runtime_summary=runtime_summary,
         session_log_path=session_log_path,
         current_behavior=current_behavior,
+        main_output_parse_error=main_output_parse_error,
+        allow_behavior_autowrite=allow_behavior_autowrite,
     )
 
     result = await Runner.run(
@@ -297,6 +315,16 @@ async def run_post_run_memory_cycle(
     behavior_before_path: Path | None = None
     behavior_after_path: Path | None = None
     behavior_diff_path: Path | None = None
+    if behavior_intent.should_update_behavior and not allow_behavior_autowrite:
+        behavior_intent = BehaviorUpdateIntent(
+            should_update_behavior=False,
+            why=(
+                "Behavior auto-write is disabled by policy "
+                "(REFLECTION_ALLOW_BEHAVIOR_AUTOWRITE=false or run parse invalid)."
+            ),
+            update_summary=[],
+            updated_behavior_markdown=None,
+        )
     if behavior_intent.should_update_behavior and behavior_intent.updated_behavior_markdown:
         (
             behavior_updated,

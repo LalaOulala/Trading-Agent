@@ -85,8 +85,105 @@ def _trace_custom_span_if_active(
         return
     if get_current_trace() is None:
         return
-    with custom_span(name, data=data, disabled=False):
+    with custom_span(name, data=_clamp_trace_payload(data), disabled=False):
         pass
+
+
+def _truncate_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + " ... (truncated)"
+
+
+def _clamp_trace_payload(data: dict[str, Any], *, max_chars: int = 9_500) -> dict[str, Any]:
+    try:
+        raw = json.dumps(data, ensure_ascii=False, default=str)
+    except Exception:
+        raw = str(data)
+    if len(raw) <= max_chars:
+        return data
+    return {
+        "truncated": True,
+        "original_size_chars": len(raw),
+        "preview": _truncate_text(raw, max_chars=max_chars - 120),
+    }
+
+
+def _compact_runtime_summary_for_trace(runtime_summary: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(runtime_summary, dict):
+        return {}
+    tool_calls = runtime_summary.get("tool_calls") or []
+    tool_outputs = runtime_summary.get("tool_outputs") or []
+    reasoning = runtime_summary.get("reasoning_summaries") or []
+    messages = runtime_summary.get("message_outputs") or []
+
+    compact_calls: list[dict[str, Any]] = []
+    if isinstance(tool_calls, list):
+        for item in tool_calls[-8:]:
+            if not isinstance(item, dict):
+                continue
+            compact_calls.append(
+                {
+                    "event_index": item.get("event_index"),
+                    "tool_name": item.get("tool_name"),
+                    "call_id": item.get("call_id"),
+                    "arguments_excerpt": _truncate_text(
+                        str(item.get("arguments_excerpt") or ""),
+                        max_chars=350,
+                    ),
+                }
+            )
+
+    compact_outputs: list[dict[str, Any]] = []
+    if isinstance(tool_outputs, list):
+        for item in tool_outputs[-8:]:
+            if not isinstance(item, dict):
+                continue
+            compact_outputs.append(
+                {
+                    "event_index": item.get("event_index"),
+                    "tool_name": item.get("tool_name"),
+                    "is_error": item.get("is_error"),
+                    "category": item.get("category"),
+                    "output_excerpt": _truncate_text(
+                        str(item.get("output_excerpt") or ""),
+                        max_chars=500,
+                    ),
+                }
+            )
+
+    return {
+        "event_count": runtime_summary.get("event_count"),
+        "tool_error_count": runtime_summary.get("tool_error_count"),
+        "tool_calls_count": len(tool_calls) if isinstance(tool_calls, list) else None,
+        "tool_outputs_count": len(tool_outputs) if isinstance(tool_outputs, list) else None,
+        "tool_calls_tail": compact_calls,
+        "tool_outputs_tail": compact_outputs,
+        "reasoning_tail": [
+            _truncate_text(str(item), max_chars=500) for item in reasoning[-4:]
+        ]
+        if isinstance(reasoning, list)
+        else [],
+        "message_outputs_tail": [
+            _truncate_text(str(item), max_chars=500) for item in messages[-4:]
+        ]
+        if isinstance(messages, list)
+        else [],
+    }
+
+
+def _sanitized_final_output_for_reflection(
+    final_output: str,
+    *,
+    parse_error: str | None,
+) -> str:
+    if not parse_error:
+        return final_output
+    return (
+        "FINAL OUTPUT OMITTED FROM REFLECTION INPUT (parse invalid).\n"
+        "Use runtime summary + snapshot context instead of raw malformed content.\n"
+        f"parse_error: {parse_error}"
+    )
 
 
 def _compact_account_for_trace(account: dict[str, Any]) -> dict[str, Any]:
@@ -560,6 +657,10 @@ def _build_effective_prompt(
         "Exigence d'horloge marché:\n"
         "- Avant toute conclusion pre-market/post-close, vérifie market_clock du snapshot ou appelle "
         "get_market_clock_snapshot.\n\n"
+        "Hygiène stricte des tools:\n"
+        "- Les arguments de tools doivent être strictement propres (ex: symboles sans préfixe ':' ni fragments "
+        "de tool-call).\n"
+        "- En cas de doute sur un symbole, reformule et valide avant l'appel tool.\n\n"
         "### Snapshot initial (JSON)\n"
         f"```json\n{_json_dumps_compact(bootstrap_context)}\n```\n\n"
         "### Tâche utilisateur\n"
@@ -827,12 +928,7 @@ async def run_once(
         "run.runtime_summary",
         data={
             "session_id": session_id,
-            "event_count": runtime_summary.get("event_count"),
-            "tool_error_count": runtime_summary.get("tool_error_count"),
-            "tool_calls": runtime_summary.get("tool_calls"),
-            "tool_outputs": runtime_summary.get("tool_outputs"),
-            "reasoning_summaries": runtime_summary.get("reasoning_summaries"),
-            "message_outputs": runtime_summary.get("message_outputs"),
+            "runtime_summary_compact": _compact_runtime_summary_for_trace(runtime_summary),
         },
         enable_tracing=enable_tracing,
     )
@@ -865,6 +961,15 @@ async def run_once(
         },
         enable_tracing=enable_tracing,
     )
+    reflection_input_final_output = _sanitized_final_output_for_reflection(
+        final_output,
+        parse_error=memory_apply_result.parse_error,
+    )
+    runtime_summary_for_reflection = {
+        **_compact_runtime_summary_for_trace(runtime_summary),
+        "source_quality_pre_run": runtime_summary.get("source_quality_pre_run"),
+        "reflection_input": runtime_summary.get("reflection_input"),
+    }
     post_run_result: PostRunMemoryResult | None = None
     post_run_error: str | None = None
     try:
@@ -872,12 +977,17 @@ async def run_once(
             session_id=session_id,
             user_prompt=prompt,
             model_name=model_name,
-            final_output=final_output,
+            final_output=reflection_input_final_output,
             bootstrap_context=bootstrap_context,
-            runtime_summary=runtime_summary,
+            runtime_summary=runtime_summary_for_reflection,
             session_log_path=logger.file_path,
             logs_root=_logs_root_path(log_dir),
             enable_tracing=enable_tracing,
+            allow_behavior_autowrite=(
+                settings.reflection_allow_behavior_autowrite
+                and memory_apply_result.parse_error is None
+            ),
+            main_output_parse_error=memory_apply_result.parse_error,
         )
         logger.log_post_run_status(
             {
@@ -989,6 +1099,10 @@ async def run_loop(
                 memory_info = cycle.memory_apply_result.summary_for_log()
                 if memory_info.get("parse_error"):
                     print(f"[memory-error] {memory_info['parse_error']}")
+                    if memory_info.get("short_memory_latest_path"):
+                        print(f"[memory] short={memory_info['short_memory_latest_path']} (fallback)")
+                    for warning in memory_info.get("system_warnings") or []:
+                        print(f"[memory-warning] {warning}")
                 else:
                     print(
                         "[memory] "
@@ -1130,6 +1244,10 @@ def main() -> None:
     memory_info = cycle.memory_apply_result.summary_for_log()
     if memory_info.get("parse_error"):
         print(f"[memory-error] {memory_info['parse_error']}")
+        if memory_info.get("short_memory_latest_path"):
+            print(f"[memory] short={memory_info['short_memory_latest_path']} (fallback)")
+        for warning in memory_info.get("system_warnings") or []:
+            print(f"[memory-warning] {warning}")
     else:
         print(
             "[memory] "

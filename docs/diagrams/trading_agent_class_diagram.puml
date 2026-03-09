@@ -8,14 +8,15 @@ class Settings {
   +openrouter_base_url: str
   +openai_tracing_api_key: str | None
   +tavily_api_key: str | None
-  +social_search_mode: str
-  +social_search_sites: tuple[str, ...]
+  +perplexity_api_key: str | None
+  +perplexity_model: str
   +alpaca_api_key: str | None
   +alpaca_secret_key: str | None
   +alpaca_paper: bool
   +alpaca_base_url: str
   +trading_allowed_symbols: tuple[str, ...]
   +trading_max_notional_usd: float | None
+  +reflection_allow_behavior_autowrite: bool
   +from_env(require_openrouter: bool = True) Settings
 }
 }
@@ -36,6 +37,13 @@ class SearchTools <<module>> {
 }
 }
 
+package "agent_trade_sdk.tools.symbol_validation" {
+class SymbolValidationTools <<module>> {
+  +normalize_symbol(symbol) str
+  +normalize_symbols_csv(symbols_csv) tuple[list[str], list[dict[str, str]]]
+}
+}
+
 package "agent_trade_sdk.tools.market_data" {
 class MarketDataTools <<module>> {
   +yfinance_quote_raw(symbol) dict
@@ -44,6 +52,16 @@ class MarketDataTools <<module>> {
   +get_price_history(symbol, period, interval, max_points) str
   +yfinance_market_snapshot_raw(symbols_csv) dict
   +get_market_snapshot(symbols_csv) str
+}
+}
+
+package "agent_trade_sdk.tools.perplexity_snapshot" {
+class PerplexitySnapshotTools <<module>> {
+  +build_perplexity_snapshot_prompt(previous_summary_5_lines) str
+  +perplexity_market_snapshot_raw() dict
+  +compact_perplexity_snapshot_for_prompt(payload, max_sources) dict
+  +_extract_summary_5_lines(snapshot_text) str
+  +_persist_latest_summary(...) tuple[Path, Path] | None
 }
 }
 
@@ -85,6 +103,7 @@ class RunCycleResult {
   +runtime_summary: dict
   +short_memory_input: dict | None
   +memory_apply_result: MemoryApplyResult
+  +post_run_memory_result: PostRunMemoryResult | None
 }
 
 class RunnerModule <<module>> {
@@ -92,6 +111,8 @@ class RunnerModule <<module>> {
   +run_loop(prompt, model, log_dir, enable_tracing, ...) None
   +_collect_input_snapshot() dict
   +_build_effective_prompt(user_prompt, snapshot, short_memory) str
+  +_clamp_trace_payload(data) dict
+  +_compact_runtime_summary_for_trace(runtime_summary) dict
   +main() None
 }
 }
@@ -157,8 +178,22 @@ class MemoryArchitecture <<module>> {
   +load_short_memory_latest() dict | None
   +load_behavior_text() str
   +parse_llm_trading_session_output(raw_text) TradingSessionLLMOutput
+  +_extract_json_payload(raw_text) dict
   +apply_memory_outputs(raw_final_output, session_id, model_name, logs_root) MemoryApplyResult
   +short_memory_prompt_block(short_memory) str
+}
+}
+
+package "agent_trade_sdk.post_run_memory" {
+class PostRunMemoryResult {
+  +journal_file_path: Path
+  +reflection_latest_path: Path
+  +reflection_archive_path: Path
+  +behavior_updated: bool
+}
+
+class PostRunMemoryModule <<module>> {
+  +run_post_run_memory_cycle(..., allow_behavior_autowrite, main_output_parse_error) PostRunMemoryResult
 }
 }
 
@@ -186,6 +221,8 @@ package "Memory Files" {
 class "SOUL.md" as SoulFile <<artifact>>
 class "behavior.md" as BehaviorFile <<artifact>>
 class "memory/short/latest.json" as ShortMemoryFile <<artifact>>
+class "memory/reflection/latest.json" as ReflectionFile <<artifact>>
+class "memory/perplexity/latest_summary.json" as PerplexitySummaryFile <<artifact>>
 class "logs/behaviors/*.md|*.diff" as BehaviorHistoryFiles <<artifact>>
 }
 
@@ -221,9 +258,12 @@ RunnerModule --> Settings
 RunnerModule --> SessionMarkdownLogger
 RunnerModule --> MemoryArchitecture
 RunnerModule --> MemoryApplyResult
+RunnerModule --> PostRunMemoryModule
+RunnerModule --> PostRunMemoryResult
 RunnerModule --> AlpacaPaperBroker
 RunnerModule --> SearchTools : tavily_search_raw
 RunnerModule --> MarketDataTools : yfinance_market_snapshot_raw
+RunnerModule --> PerplexitySnapshotTools
 RunnerModule --> AgentsRunner
 RunnerModule --> TracingSupport
 RunnerModule --> AgentsTrace
@@ -233,8 +273,12 @@ RunnerModule --> RunCycleResult
 SearchTools --> Settings
 SearchTools --> TavilyClient
 MarketDataTools --> YFinanceTicker
+MarketDataTools --> SymbolValidationTools
+PerplexitySnapshotTools --> Settings
+PerplexitySnapshotTools --> PerplexitySummaryFile
 
 TradingTools --> AlpacaPaperBroker
+TradingTools --> SymbolValidationTools
 AlpacaConnectionConfig --> Settings
 AlpacaPaperBroker *-- AlpacaConnectionConfig
 AlpacaPaperBroker --> TradingClient
@@ -255,5 +299,8 @@ MemoryApplyResult *-- BehaviorHistoryResult
 MemoryArchitecture --> BehaviorFile
 MemoryArchitecture --> ShortMemoryFile
 MemoryArchitecture --> BehaviorHistoryFiles
+
+PostRunMemoryModule --> ReflectionFile
+RunnerModule --> PerplexitySummaryFile
 
 @enduml

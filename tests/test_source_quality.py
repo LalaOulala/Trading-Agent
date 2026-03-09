@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from agent_trade_sdk.source_quality import (
     evaluate_perplexity_quality,
     evaluate_tavily_quality,
@@ -7,18 +9,19 @@ from agent_trade_sdk.source_quality import (
 
 
 def test_tavily_quality_report_stable_payload() -> None:
+    now = datetime.now(timezone.utc)
     payload = {
         "results": [
             {
                 "title": "NVIDIA earnings beat expectations; guidance raised",
                 "url": "https://www.reuters.com/markets/us/nvidia-earnings-2026-03-05/",
-                "published_date": "2026-03-05T14:10:00+00:00",
+                "published_date": (now - timedelta(hours=2)).isoformat(),
                 "content": "US equities, earnings, guidance, options flow and volatility.",
             },
             {
                 "title": "Banks lead as yields move higher",
                 "url": "https://www.cnbc.com/2026/03/05/us-markets-live-updates.html",
-                "published_date": "2026-03-05T13:40:00+00:00",
+                "published_date": (now - timedelta(hours=3)).isoformat(),
                 "content": "Financials outperform as treasury yields climb.",
             },
         ]
@@ -50,4 +53,3 @@ def test_perplexity_quality_report_handles_missing_dates() -> None:
     assert report.freshness_hours_median is None
     assert report.duplicate_ratio >= 0.4
     assert "missing_publish_dates" in report.diagnostics
-

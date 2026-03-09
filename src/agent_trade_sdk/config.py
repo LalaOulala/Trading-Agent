@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
+os.environ.setdefault("LITELLM_LOG", "ERROR")
+os.environ.setdefault("LITELLM_SUPPRESS_DEBUG_INFO", "true")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -63,6 +65,7 @@ class Settings:
     alpaca_base_url: str
     trading_allowed_symbols: tuple[str, ...]
     trading_max_notional_usd: float | None
+    reflection_allow_behavior_autowrite: bool
 
     @classmethod
     def from_env(cls, require_openrouter: bool = True) -> "Settings":
@@ -101,4 +104,7 @@ class Settings:
                 if symbol.strip()
             ),
             trading_max_notional_usd=_env_float("TRADING_MAX_NOTIONAL_USD"),
+            reflection_allow_behavior_autowrite=_env_bool(
+                "REFLECTION_ALLOW_BEHAVIOR_AUTOWRITE", False
+            ),
         )

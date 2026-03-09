@@ -253,7 +253,16 @@ def evaluate_perplexity_quality(perplexity_payload: dict[str, Any] | None) -> So
                     "snippet": item.get("snippet"),
                 }
             )
-    return _compute_quality(provider="perplexity", items=items)
+    report = _compute_quality(provider="perplexity", items=items)
+    payload_diagnostics = payload.get("quality_diagnostics")
+    if isinstance(payload_diagnostics, list):
+        existing = set(report.diagnostics)
+        for item in payload_diagnostics:
+            text = str(item).strip()
+            if text and text not in existing:
+                report.diagnostics.append(text)
+                existing.add(text)
+    return report
 
 
 def evaluate_snapshot_source_quality(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -271,4 +280,3 @@ def evaluate_snapshot_source_quality(snapshot: dict[str, Any]) -> dict[str, dict
         "tavily": tavily.model_dump(),
         "perplexity": perplexity.model_dump(),
     }
-

@@ -7,6 +7,12 @@ from typing import Any, Literal
 import yfinance as yf
 from agents import function_tool
 
+from agent_trade_sdk.tools.symbol_validation import (
+    SymbolValidationError,
+    normalize_symbol,
+    normalize_symbols_csv,
+)
+
 
 HistoryPeriod = Literal[
     "1d",
@@ -88,7 +94,7 @@ def _safe_fast_info(ticker: yf.Ticker) -> dict[str, Any]:
 
 
 def yfinance_quote_raw(symbol: str) -> dict[str, Any]:
-    normalized_symbol = symbol.strip().upper()
+    normalized_symbol = normalize_symbol(symbol)
     ticker = yf.Ticker(normalized_symbol)
 
     info: dict[str, Any] = {}
@@ -142,8 +148,16 @@ def yfinance_quote_raw(symbol: str) -> dict[str, Any]:
 @function_tool
 def get_market_quote(symbol: str) -> str:
     """Get a compact quote snapshot for one symbol from Yahoo Finance."""
-
-    payload = yfinance_quote_raw(symbol=symbol)
+    try:
+        payload = yfinance_quote_raw(symbol=symbol)
+    except SymbolValidationError as exc:
+        payload = {
+            "error": {
+                "type": "invalid_symbol",
+                "symbol": str(symbol),
+                "message": str(exc),
+            }
+        }
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -155,7 +169,7 @@ def yfinance_price_history_raw(
 ) -> dict[str, Any]:
     """Get OHLCV history for a symbol from Yahoo Finance as a dict."""
 
-    normalized_symbol = symbol.strip().upper()
+    normalized_symbol = normalize_symbol(symbol)
     ticker = yf.Ticker(normalized_symbol)
     history = ticker.history(period=period, interval=interval, auto_adjust=False)
 
@@ -192,13 +206,21 @@ def get_price_history(
     max_points: int = 60,
 ) -> str:
     """Get OHLCV history for a symbol from Yahoo Finance as compact JSON."""
-
-    payload = yfinance_price_history_raw(
-        symbol=symbol,
-        period=period,
-        interval=interval,
-        max_points=max_points,
-    )
+    try:
+        payload = yfinance_price_history_raw(
+            symbol=symbol,
+            period=period,
+            interval=interval,
+            max_points=max_points,
+        )
+    except SymbolValidationError as exc:
+        payload = {
+            "error": {
+                "type": "invalid_symbol",
+                "symbol": str(symbol),
+                "message": str(exc),
+            }
+        }
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -207,10 +229,8 @@ def yfinance_market_snapshot_raw(
 ) -> dict[str, Any]:
     """Get a multi-symbol market snapshot from Yahoo Finance as a dict."""
 
-    symbols = [token.strip().upper() for token in symbols_csv.split(",") if token.strip()]
+    symbols, errors = normalize_symbols_csv(symbols_csv)
     snapshots: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-
     for symbol in symbols:
         try:
             snapshots.append(yfinance_quote_raw(symbol=symbol))

@@ -17,15 +17,16 @@ Construire un socle propre pour un agent autonome de trading simulé:
 4. **Recherche web/social**: Tavily (phase 1), requêtes sociales via filtres de domaines
 5. **Execution trading**: `alpaca-py` (paper trading API)
 6. **Config**: `.env` + `python-dotenv`
-7. **Tracing**: OpenAI tracing spans (pré-run, tools, réflexion post-run)
+7. **Tracing**: OpenAI tracing spans (pré-run, tools, réflexion post-run) avec clamp payload
 8. **Réflexion**: second agent post-run avec sortie structurée (`ReflectionConclusion`)
+9. **Mémoire Perplexity dédiée**: `memory/perplexity/latest_summary.json`
 
 ## Philosophie agentique moderne
 
 - Boucle cible: `Observe -> Orient -> Decide -> Act -> Reflect`.
 - Séparer exécution et introspection pour éviter l’auto-ancrage.
 - Garder les garde-fous critiques en code déterministe.
-- Contraindre les tools avec schémas stricts et sorties fidèles.
+- Contraindre les tools avec validation stricte des arguments et sorties fidèles.
 - Conserver une traçabilité de bout en bout: source -> interprétation -> décision.
 
 ## Boucle d’exécution
@@ -34,13 +35,18 @@ Construire un socle propre pour un agent autonome de trading simulé:
 - `behavior.md` (long terme adaptatif)
 - `memory/reflection/latest.json` (conclusion inter-session prioritaire)
 - fallback compact depuis `memory/short/latest.json`
+- `memory/perplexity/latest_summary.json` (continuité Perplexity, 5 lignes)
 
 2. Snapshot pré-run:
 - horloge marché (`market_clock`)
 - portfolio Alpaca
 - market snapshot yfinance
 - news Tavily
-- recherche Perplexity
+- recherche Perplexity en langage naturel:
+  - continuité run précédent,
+  - nouveautés fraîches (<6h),
+  - thèmes nouveaux,
+  - résumé final 5 lignes mémorisé pour le run suivant
 
 3. Évaluation de qualité des sources:
 - `SourceQualityReport` pour Tavily et Perplexity
@@ -53,11 +59,14 @@ Construire un socle propre pour un agent autonome de trading simulé:
 5. Exécution agent principal:
 - tools de marché/recherche/trading
 - sortie JSON stricte (décision + mémoire forensic)
+- parse JSON robuste côté pipeline (bloc `json` + extraction objet équilibré)
+- fallback mémoire minimal en cas de sortie invalide (pas de crash loop)
 
 6. Réflexion post-run:
 - journal markdown inter-session (`logs/journals/`)
 - conclusion structurée (`memory/reflection/latest.json`)
-- mise à jour optionnelle de `behavior.md` uniquement
+- mise à jour optionnelle de `behavior.md` seulement si
+  `REFLECTION_ALLOW_BEHAVIOR_AUTOWRITE=true` **et** parse run valide
 - `SOUL.md` reste immuable
 
 ## Modules clés
@@ -68,6 +77,8 @@ Construire un socle propre pour un agent autonome de trading simulé:
 - `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/source_quality.py`
 - `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/strategy_guardrails.py`
 - `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/session_log.py`
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/tools/perplexity_snapshot.py`
+- `/Users/lala/CascadeProjects/agent_trade_sdk/src/agent_trade_sdk/tools/symbol_validation.py`
 
 ## Format des tools (OpenAI Agents SDK)
 
@@ -98,3 +109,15 @@ def place_market_order(
 - exécution runtime (tool calls, outputs, reasoning/message summaries)
 - attribution source dans la décision finale
 - réflexion post-run (journal, conclusion, update behavior)
+- Tous les payloads de span sont clampés (<10KB) avant export.
+
+## Résilience inter-run
+
+- Si la sortie agent est non-JSON ou mal formée:
+  - le run ne crash pas,
+  - une mémoire courte fallback est écrite,
+  - la réflexion s’appuie sur contexte sanitizé (snapshot + runtime compact),
+  - aucune auto-écriture de `behavior.md` n’est autorisée.
+
+- Les symboles tools sont validés en amont (regex stricte + rejet fragments tool-call), ce qui évite les appels
+  externes parasites (`:IYH`, fragments JSON, symboles vides).

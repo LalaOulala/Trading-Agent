@@ -11,6 +11,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
 from agent_trade_sdk.config import Settings
+from agent_trade_sdk.tools.symbol_validation import SymbolValidationError, normalize_symbol
 
 
 OrderSideLiteral = Literal["buy", "sell"]
@@ -79,7 +80,7 @@ class AlpacaPaperBroker:
             raise RuntimeError("Refusing to run: ALPACA_PAPER must be true for this project.")
 
     def _enforce_symbol_policy(self, symbol: str) -> str:
-        normalized = symbol.upper().strip()
+        normalized = normalize_symbol(symbol)
         allowed = self.config.allowed_symbols
         if allowed and normalized not in allowed:
             raise ValueError(f"Symbol {normalized} is not allowed. Allowed symbols: {allowed}")
@@ -227,16 +228,25 @@ def place_market_order(
     time_in_force: TimeInForceLiteral = "day",
 ) -> str:
     """Submit a market order on Alpaca paper trading and return execution metadata as JSON."""
-
-    broker = AlpacaPaperBroker()
-    order = broker.submit_market_order(
-        symbol=symbol,
-        side=side,
-        qty=qty,
-        notional=notional,
-        time_in_force=time_in_force,
-    )
-    return json.dumps(order, ensure_ascii=False)
+    try:
+        broker = AlpacaPaperBroker()
+        order = broker.submit_market_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            notional=notional,
+            time_in_force=time_in_force,
+        )
+        return json.dumps(order, ensure_ascii=False)
+    except SymbolValidationError as exc:
+        payload = {
+            "error": {
+                "type": "invalid_symbol",
+                "symbol": str(symbol),
+                "message": str(exc),
+            }
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
 
 @function_tool
@@ -246,22 +256,40 @@ def open_short_position(
     time_in_force: TimeInForceLiteral = "day",
 ) -> str:
     """Open a short position using a SELL market order (paper account must support shorting)."""
-
-    broker = AlpacaPaperBroker()
-    order = broker.submit_market_order(
-        symbol=symbol,
-        side="sell",
-        qty=qty,
-        notional=None,
-        time_in_force=time_in_force,
-    )
-    return json.dumps(order, ensure_ascii=False)
+    try:
+        broker = AlpacaPaperBroker()
+        order = broker.submit_market_order(
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            notional=None,
+            time_in_force=time_in_force,
+        )
+        return json.dumps(order, ensure_ascii=False)
+    except SymbolValidationError as exc:
+        payload = {
+            "error": {
+                "type": "invalid_symbol",
+                "symbol": str(symbol),
+                "message": str(exc),
+            }
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
 
 @function_tool
 def close_open_position(symbol: str) -> str:
     """Close an open position for the given symbol."""
-
-    broker = AlpacaPaperBroker()
-    order = broker.close_position(symbol=symbol)
-    return json.dumps(order, ensure_ascii=False)
+    try:
+        broker = AlpacaPaperBroker()
+        order = broker.close_position(symbol=symbol)
+        return json.dumps(order, ensure_ascii=False)
+    except SymbolValidationError as exc:
+        payload = {
+            "error": {
+                "type": "invalid_symbol",
+                "symbol": str(symbol),
+                "message": str(exc),
+            }
+        }
+        return json.dumps(payload, ensure_ascii=False)

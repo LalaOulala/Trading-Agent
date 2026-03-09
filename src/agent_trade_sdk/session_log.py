@@ -46,6 +46,20 @@ def _truncate_text(value: str, max_chars: int = 800) -> str:
     return value[:max_chars] + " ... (truncated)"
 
 
+def _clamp_trace_payload(data: dict[str, Any], *, max_chars: int = 9_500) -> dict[str, Any]:
+    try:
+        raw = json.dumps(data, ensure_ascii=False, default=str)
+    except Exception:
+        raw = str(data)
+    if len(raw) <= max_chars:
+        return data
+    return {
+        "truncated": True,
+        "original_size_chars": len(raw),
+        "preview": _truncate_text(raw, max_chars=max_chars - 120),
+    }
+
+
 def _to_mapping(raw_item: Any) -> dict[str, Any]:
     if isinstance(raw_item, dict):
         return raw_item
@@ -197,7 +211,7 @@ class SessionMarkdownLogger:
             return
         if get_current_trace() is None:
             return
-        with custom_span(name, data=data, disabled=False):
+        with custom_span(name, data=_clamp_trace_payload(data), disabled=False):
             pass
 
     @staticmethod

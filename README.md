@@ -5,6 +5,7 @@ Agent de trading paper avec boucle agentique moderne:
 - Orchestration OpenAI Agents SDK
 - Réflexion inter-session injectée au prochain run
 - Guardrails anti-inaction + traçage des sources
+- Résilience inter-run (fallback mémoire si sortie non-JSON)
 
 Principaux composants:
 - Orchestration agentique avec `openai-agents-python`
@@ -12,6 +13,7 @@ Principaux composants:
 - Données de marché via `yfinance`
 - Tools de recherche web/social via Tavily
 - Snapshot macro/news enrichi via Perplexity (si clé disponible)
+- Perplexity en langage naturel + résumé 5 lignes persisté entre runs
 - Tools de paper trading via Alpaca
 
 ## Boucle agentique
@@ -23,6 +25,12 @@ Principaux composants:
 5. Persistance mémoire courte forensic.
 6. Run agent de réflexion inter-session.
 7. Injection de `memory/reflection/latest.json` au run suivant.
+
+## Variables d'environnement importantes
+
+- `REFLECTION_ALLOW_BEHAVIOR_AUTOWRITE` (défaut `false`): autorise l'écriture automatique de `behavior.md` en post-run.
+- `LITELLM_LOG` (défaut `ERROR`): niveau de logs LiteLLM (surchargable).
+- `LITELLM_SUPPRESS_DEBUG_INFO` (défaut `true`): réduit le bruit runtime.
 
 ## Setup rapide
 
@@ -77,7 +85,7 @@ python scripts/test_alpaca_order.py --action close --symbol SPY
 ## Lancer un run agent unique
 
 ```bash
-python -m agent_trade_sdk.runner --prompt "Analyse AAPL et propose une action avec justification."
+PYTHONPATH=src .venv/bin/python -m agent_trade_sdk.runner --prompt "Analyse AAPL et propose une action avec justification."
 ```
 
 Si `--prompt` est omis, le runner charge automatiquement:
@@ -87,7 +95,7 @@ Si `--prompt` est omis, le runner charge automatiquement:
 Exemple:
 
 ```bash
-python -m agent_trade_sdk.runner
+PYTHONPATH=src .venv/bin/python -m agent_trade_sdk.runner
 ```
 
 Le runner crée:
@@ -99,13 +107,13 @@ Le tracing SDK reste désactivé par défaut.
 Pour changer le dossier:
 
 ```bash
-python -m agent_trade_sdk.runner --prompt "..." --log-dir logs
+PYTHONPATH=src .venv/bin/python -m agent_trade_sdk.runner --prompt "..." --log-dir logs
 ```
 
 Pour réactiver explicitement le tracing SDK:
 
 ```bash
-python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
+PYTHONPATH=src .venv/bin/python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
 ```
 
 ## Lancer en boucle sans repasser le prompt
@@ -113,19 +121,19 @@ python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
 Le mode loop peut démarrer sans `--prompt` si le fichier `prompts/default_loop_prompt.txt` existe.
 
 ```bash
-python -m agent_trade_sdk.runner --loop --interval-minutes 15 --enable-tracing
+PYTHONPATH=src .venv/bin/python -m agent_trade_sdk.runner --loop --interval-minutes 15 --enable-tracing
 ```
 
 On peut aussi forcer un autre fichier:
 
 ```bash
-python -m agent_trade_sdk.runner --loop --prompt-file /chemin/vers/mon_prompt.txt
+PYTHONPATH=src .venv/bin/python -m agent_trade_sdk.runner --loop --prompt-file /chemin/vers/mon_prompt.txt
 ```
 
 ## Tracing OpenAI (à terminer)
 
 ```bash
-python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
+PYTHONPATH=src .venv/bin/python -m agent_trade_sdk.runner --prompt "..." --enable-tracing
 ```
 
 Les spans incluent notamment:
@@ -133,6 +141,26 @@ Les spans incluent notamment:
 - qualité des sources
 - attribution source -> décision
 - statut de la réflexion post-run
+- payloads de spans compactés/clampés (<10KB) pour éviter les erreurs tracing
+
+## Contrat Perplexity
+
+- Sortie demandée en langage naturel (pas de JSON strict).
+- Le prompt impose:
+  - continuité depuis le run précédent,
+  - nouveautés fraîches (<6h),
+  - thèmes nouveaux (ouverture obligatoire),
+  - résumé final 5 lignes.
+- Le résumé est persisté dans `memory/perplexity/latest_summary.json` et réinjecté au run suivant.
+- Diagnostic `low_novelty` si recouvrement thématique trop élevé avec le résumé précédent.
+
+## Résilience mémoire
+
+- Le parse de sortie agent est robuste (bloc `json` + extraction objet équilibré).
+- Si parse invalide:
+  - mémoire courte fallback écrite (pas de crash loop),
+  - réflexion lancée sur contexte sanitizé,
+  - auto-update `behavior.md` bloqué.
 
 ## Tests
 
@@ -153,3 +181,4 @@ PYTHONPATH=src .venv/bin/python -m pytest -q
 - Identité stable: `SOUL.md`
 - Mémoire longue adaptive: `behavior.md`
 - Réflexion injectée: `memory/reflection/latest.json`
+- Continuité Perplexity: `memory/perplexity/latest_summary.json`

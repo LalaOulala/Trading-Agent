@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,15 +40,94 @@ def _safe_json(data: Any, *, max_chars: int = 20000) -> str:
     return text[:max_chars] + "\n... (truncated)"
 
 
-def _extract_json_text(raw_text: str) -> str:
+def _extract_fenced_blocks(raw_text: str) -> list[tuple[str | None, str]]:
+    blocks: list[tuple[str | None, str]] = []
+    pattern = re.compile(r"```([a-zA-Z0-9_-]+)?\s*\n(.*?)\n```", flags=re.DOTALL)
+    for match in pattern.finditer(raw_text):
+        language = match.group(1).strip().lower() if match.group(1) else None
+        body = (match.group(2) or "").strip()
+        if body:
+            blocks.append((language, body))
+    return blocks
+
+
+def _extract_balanced_json_objects(raw_text: str, *, max_chars: int = 250_000) -> list[str]:
+    candidates: list[str] = []
+    depth = 0
+    start_idx: int | None = None
+    in_string = False
+    escaping = False
+
+    for idx, char in enumerate(raw_text):
+        if in_string:
+            if escaping:
+                escaping = False
+            elif char == "\\":
+                escaping = True
+            elif char == "\"":
+                in_string = False
+            continue
+
+        if char == "\"":
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start_idx = idx
+            depth += 1
+            continue
+        if char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start_idx is not None:
+                candidate = raw_text[start_idx : idx + 1].strip()
+                if candidate and len(candidate) <= max_chars:
+                    candidates.append(candidate)
+                start_idx = None
+
+    return candidates
+
+
+def _try_parse_json_dict(candidate: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_json_payload(raw_text: str) -> dict[str, Any]:
     text = raw_text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 3:
-            # Strip first and last code fences when present.
-            if lines[0].startswith("```") and lines[-1].startswith("```"):
-                return "\n".join(lines[1:-1]).strip()
-    return text
+    parsed_candidates: list[dict[str, Any]] = []
+
+    direct = _try_parse_json_dict(text)
+    if direct is not None:
+        parsed_candidates.append(direct)
+
+    fenced_blocks = _extract_fenced_blocks(text)
+    for language, block in fenced_blocks:
+        if language and language not in {"json", "javascript", "js"}:
+            continue
+        parsed = _try_parse_json_dict(block)
+        if parsed is not None:
+            parsed_candidates.append(parsed)
+
+    for candidate in _extract_balanced_json_objects(text):
+        parsed = _try_parse_json_dict(candidate)
+        if parsed is not None:
+            parsed_candidates.append(parsed)
+
+    if not parsed_candidates:
+        raise ValueError("Unable to extract any valid JSON object from final output.")
+
+    for payload in reversed(parsed_candidates):
+        if "trading_decision" in payload:
+            return payload
+
+    for payload in reversed(parsed_candidates):
+        if isinstance(payload.get("action"), str) or isinstance(payload.get("decision"), str):
+            return payload
+
+    return parsed_candidates[-1]
 
 
 def _stringify_value(value: Any, *, max_chars: int = 4000) -> str:
@@ -199,10 +279,7 @@ def load_behavior_text() -> str:
 
 
 def parse_llm_trading_session_output(raw_text: str) -> TradingSessionLLMOutput:
-    json_text = _extract_json_text(raw_text)
-    payload = json.loads(json_text)
-    if not isinstance(payload, dict):
-        raise ValueError("Final output JSON must be an object.")
+    payload = _extract_json_payload(raw_text)
     if "trading_decision" not in payload:
         legacy_action = payload.get("action") or payload.get("decision")
         if isinstance(legacy_action, str):
@@ -257,6 +334,60 @@ def parse_llm_trading_session_output(raw_text: str) -> TradingSessionLLMOutput:
             "should_update_behavior=true but updated_behavior_markdown is empty or missing."
         )
     return parsed
+
+
+def _build_parse_failure_fallback_output(
+    *,
+    parse_error: str,
+    runtime_summary: dict[str, Any] | None,
+) -> TradingSessionLLMOutput:
+    audit = _runtime_trading_execution_audit(runtime_summary)
+    report_lines = [
+        "Sortie agent non parseable: fallback mémoire appliqué.",
+        f"parse_error: {parse_error}",
+        f"runtime_event_count: {(runtime_summary or {}).get('event_count') if isinstance(runtime_summary, dict) else None}",
+        f"trading_tool_calls_count: {audit.get('trading_tool_calls_count')}",
+        f"trading_tool_success_count: {audit.get('trading_tool_success_count')}",
+    ]
+    return TradingSessionLLMOutput(
+        trading_decision=TradingDecisionBlock(
+            action="NO_TRADE",
+            symbol=None,
+            confidence="low",
+            rationale=(
+                "Sortie finale invalide techniquement; décision neutralisée automatiquement pour préserver "
+                "la cohérence inter-run."
+            ),
+            signal_principal="Parse failure on main output",
+            risk_identified="Memory contamination risk from malformed output",
+            invalidation_condition="Rétablir un JSON de sortie valide contenant trading_decision",
+            executed_order=None,
+        ),
+        session_summary=(
+            "Fallback mémoire: run conservé malgré une sortie finale non parseable. "
+            "Le prochain cycle doit produire un JSON strict valide."
+        ),
+        decision_report=" | ".join(report_lines),
+        self_critique=(
+            "La sortie du run principal était invalide et n'a pas été propagée en mémoire brute. "
+            "Fallback minimal appliqué."
+        ),
+        pitfalls_to_avoid_next_run=[
+            "Ne pas mixer prose et JSON non borné sans bloc JSON valide contenant trading_decision.",
+            "Toujours vérifier la validité JSON finale avant clôture du run.",
+        ],
+        next_session_directives=[
+            "Retourner un JSON strict avec la clé trading_decision.",
+            "Conserver executed_order=null si aucun tool de trading n'a réussi.",
+        ],
+        open_questions=["Pourquoi la sortie finale a-t-elle perdu sa structure JSON ?"],
+        long_memory_update_intent=LongMemoryUpdateIntent(
+            should_update_behavior=False,
+            why="Parse failure fallback: behavior update disabled.",
+            update_summary=[],
+            updated_behavior_markdown=None,
+        ),
+    )
 
 
 def _write_short_memory(
@@ -469,14 +600,31 @@ def apply_memory_outputs(
     try:
         parsed = parse_llm_trading_session_output(raw_final_output)
     except Exception as exc:
+        parse_error = f"{type(exc).__name__}: {exc}"
+        fallback_output = _build_parse_failure_fallback_output(
+            parse_error=parse_error,
+            runtime_summary=runtime_summary,
+        )
+        warnings = [
+            "Final output parse failed; fallback short memory record generated.",
+            parse_error,
+        ]
+        audit = _runtime_trading_execution_audit(runtime_summary)
+        short_latest, short_archive = _write_short_memory(
+            parsed_output=fallback_output,
+            session_id=session_id,
+            model_name=model_name,
+            system_warnings=warnings,
+            execution_validation={**audit, "status": "parse_failed"},
+        )
         return MemoryApplyResult(
             parsed_output=None,
-            short_memory_latest_path=None,
-            short_memory_archive_path=None,
+            short_memory_latest_path=short_latest,
+            short_memory_archive_path=short_archive,
             behavior_history=None,
-            system_warnings=[],
-            execution_validation=None,
-            parse_error=f"{type(exc).__name__}: {exc}",
+            system_warnings=warnings,
+            execution_validation={**audit, "status": "parse_failed"},
+            parse_error=parse_error,
         )
 
     system_warnings, execution_validation = _enforce_trading_execution_consistency(

@@ -1,144 +1,32 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
-from typing import Any, Literal
-
-from pydantic import BaseModel, Field, ValidationError
+from pathlib import Path
+from typing import Any
 
 from agent_trade_sdk.config import Settings
 
 
-AssetClass = Literal["equities", "rates", "fx", "commodities", "crypto", "credit", "vol"]
-Impact = Literal["low", "medium", "high"]
-Regime = Literal["risk_on", "risk_off", "mixed"]
+ROOT_DIR = Path(__file__).resolve().parents[3]
+PERPLEXITY_MEMORY_DIR = ROOT_DIR / "memory" / "perplexity"
+PERPLEXITY_LATEST_SUMMARY_PATH = PERPLEXITY_MEMORY_DIR / "latest_summary.json"
+PERPLEXITY_ARCHIVE_DIR = PERPLEXITY_MEMORY_DIR / "archive"
+
+SUMMARY_START_MARKER = "=== SUMMARY_5_LINES ==="
+SUMMARY_END_MARKER = "=== END_SUMMARY_5_LINES ==="
 
 
-class MarketMove(BaseModel):
-    asset_class: AssetClass
-    asset: str = Field(
-        ...,
-        description="Ex: S&P 500, Nasdaq 100, US10Y, DXY, WTI, Gold, BTC, VIX",
-    )
-    direction: Literal["up", "down", "flat"]
-    magnitude: str | None = Field(None, description="Ex: +1.2%, -8 bps")
-    timeframe: Literal["last_6h", "last_24h"]
-    driver: str = Field(..., description="Cause principale, spécifique (pas généraliste)")
-    why_it_matters_for_us_equities: str
-    evidence_ids: list[int] = Field(
-        default_factory=list,
-        description="Indices vers search_results (0..n-1)",
-    )
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-class BreakingNewsItem(BaseModel):
-    timestamp_hint: str | None = Field(
-        None,
-        description="Heure/date si présente dans la source (ET ou UTC). Sinon laisse null.",
-    )
-    category: Literal[
-        "earnings",
-        "macro",
-        "fed",
-        "geopolitics",
-        "policy_regulation",
-        "mna",
-        "company",
-        "markets",
-        "other",
-    ]
-    headline: str
-    tickers_or_assets: list[str] = Field(
-        default_factory=list,
-        description="Tickers US si possible, sinon actifs (US10Y, DXY...)",
-    )
-    why_it_matters: str
-    evidence_ids: list[int] = Field(default_factory=list)
-
-
-class ThemeItem(BaseModel):
-    theme: str = Field(..., description="Ex: 'Regional banks stress', 'AI capex', 'Oil supply shock'")
-    sectors_involved: list[str] = Field(
-        default_factory=list,
-        description="Ex: Financials, Healthcare, Industrials...",
-    )
-    representative_tickers: list[str] = Field(
-        default_factory=list,
-        description="Tickers US diversifiés",
-    )
-    net_bias: Literal["bullish", "bearish", "mixed", "unclear"]
-    reasoning: str
-    evidence_ids: list[int] = Field(default_factory=list)
-
-
-class WatchNextEvent(BaseModel):
-    time_window_et: str = Field(..., description="Ex: 'Today 08:30 ET', 'Tue after close'")
-    event_type: Literal[
-        "macro_data",
-        "earnings",
-        "fed_speaker",
-        "treasury_auction",
-        "sec_filing",
-        "company_event",
-        "geopolitics",
-        "other",
-    ]
-    event: str = Field(..., description="Nom précis (ex: CPI, FOMC minutes, AAPL earnings...)")
-    tickers_or_assets: list[str] = Field(default_factory=list)
-    what_to_watch: str = Field(
-        ...,
-        description="Le signal clef à surveiller (surprise vs consensus, guidance, wording...)",
-    )
-    expected_volatility: Impact
-    evidence_ids: list[int] = Field(default_factory=list)
-
-
-class NaturalLanguageBlock(BaseModel):
-    headline: str = Field(..., description="1 phrase type desk headline")
-    narrative: str = Field(..., description="8-12 lignes, orienté trading US, pas généraliste")
-    bullet_takeaways: list[str] = Field(
-        default_factory=list,
-        description="6-10 bullets actionnables (sans dire 'achète/vends')",
-    )
-
-
-class MarketSnapshot(BaseModel):
-    as_of_utc: str
-    window: Literal["last_24h"]
-    regime: Regime
-    natural_language: NaturalLanguageBlock
-    top_drivers: list[str] = Field(..., description="3 à 7 drivers principaux, spécifiques")
-    breaking_news_last_6h: list[BreakingNewsItem] = Field(..., description="5 à 10 items récents")
-    key_moves: list[MarketMove] = Field(..., description="8 à 14 mouvements cross-asset")
-    themes_diversified: list[ThemeItem] = Field(..., description="6 à 10 thèmes, secteurs variés")
-    watch_next_24h: list[WatchNextEvent] = Field(..., description="8 à 15 événements à surveiller")
-    risk_flags: list[str]
-    confidence: float = Field(..., ge=0, le=1)
-
-
-def build_perplexity_snapshot_prompt() -> str:
-    return (
-        "Rôle: analyste de desk 'US equities + macro' orienté trading (intraday/swing court terme).\n"
-        "Objectif: fournir un snapshot ULTRA-FRAIS (dernières 24h, avec emphase sur dernières 6h) utile à des agents.\n\n"
-        "Exigences de fraîcheur:\n"
-        "- Ne couvre QUE les dernières 24h.\n"
-        "- Dans 'breaking_news_last_6h', mets des infos de dernière minute (idéalement <6h) et indique une "
-        "'timestamp_hint' si trouvable.\n\n"
-        "Exigences de diversité (IMPORTANT):\n"
-        "- Equities US: au moins 6 tickers/événements venant de secteurs différents (pas plus de 2 items Tech/AI).\n"
-        "- Inclure aussi: rates (UST), FX (USD/DXY), commodities (oil ou gold), volatility (VIX) — au minimum 1 "
-        "item chacun dans key_moves.\n"
-        "- Varier les thèmes: earnings/guidance, macro data, Fed, geopolitique, régulation, M&A, credit/liquidity.\n\n"
-        "Exigences de qualité (anti-généralités):\n"
-        "- Pas de phrases vagues du style 'markets rose on optimism'. Donne des drivers précis + ce qui a changé.\n"
-        "- Mets 'why_it_matters_for_us_equities' pour chaque key move.\n\n"
-        "Sources:\n"
-        "- N'inclus AUCUNE URL dans le JSON.\n"
-        "- Utilise evidence_ids (0..n-1) qui pointent vers les search_results renvoyés par l'API.\n"
-        "- Priorise des médias/organismes financiers reconnus et des sources spécialisées.\n\n"
-        "Sortie:\n"
-        "- Retourne STRICTEMENT un JSON valide conforme au schéma.\n"
-    )
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _extract_message_content_text(content: Any) -> str:
@@ -178,6 +66,136 @@ def _extract_citations(completion: Any) -> list[str]:
     return [str(c) for c in citations]
 
 
+def _normalize_summary_lines(text: str, *, max_lines: int = 5) -> str:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        line = re.sub(r"^[\-*•\d\)\.\s]+", "", line).strip()
+        if not line:
+            continue
+        lines.append(line)
+        if len(lines) >= max_lines:
+            break
+    return "\n".join(lines)
+
+
+def _extract_summary_5_lines(snapshot_text: str) -> str:
+    if not snapshot_text.strip():
+        return ""
+    block_pattern = re.compile(
+        rf"{re.escape(SUMMARY_START_MARKER)}\s*(.*?)\s*{re.escape(SUMMARY_END_MARKER)}",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    block_match = block_pattern.search(snapshot_text)
+    if block_match:
+        return _normalize_summary_lines(block_match.group(1), max_lines=5)
+
+    lowered = snapshot_text.lower()
+    fallback_markers = ("résumé 5 lignes", "resume 5 lines", "summary 5 lines")
+    marker_index = min(
+        (lowered.find(marker) for marker in fallback_markers if marker in lowered),
+        default=-1,
+    )
+    if marker_index >= 0:
+        tail = snapshot_text[marker_index:]
+        return _normalize_summary_lines(tail, max_lines=5)
+
+    return _normalize_summary_lines("\n".join(snapshot_text.splitlines()[-12:]), max_lines=5)
+
+
+def _tokenize_for_novelty(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]{3,}", text.lower())
+        if token not in {"the", "and", "for", "with", "sur", "dans", "les", "des", "une", "que"}
+    }
+
+
+def _overlap_ratio(previous: str, current: str) -> float:
+    prev_tokens = _tokenize_for_novelty(previous)
+    curr_tokens = _tokenize_for_novelty(current)
+    if not prev_tokens or not curr_tokens:
+        return 0.0
+    common = prev_tokens.intersection(curr_tokens)
+    return round(len(common) / max(len(prev_tokens), 1), 3)
+
+
+def _load_latest_summary_payload() -> dict[str, Any] | None:
+    if not PERPLEXITY_LATEST_SUMMARY_PATH.exists():
+        return None
+    try:
+        raw = json.loads(PERPLEXITY_LATEST_SUMMARY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _load_latest_summary_text() -> str | None:
+    payload = _load_latest_summary_payload()
+    if not isinstance(payload, dict):
+        return None
+    summary = payload.get("summary_5_lines")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    return None
+
+
+def _persist_latest_summary(
+    *,
+    summary_5_lines: str,
+    requested_at_utc: str,
+    model: str,
+    overlap_ratio: float,
+    diagnostics: list[str],
+) -> tuple[Path, Path] | None:
+    if not summary_5_lines.strip():
+        return None
+    payload = {
+        "generated_at_utc": _utc_now().isoformat(),
+        "requested_at_utc": requested_at_utc,
+        "model": model,
+        "summary_5_lines": summary_5_lines,
+        "novelty_overlap_ratio": overlap_ratio,
+        "quality_diagnostics": diagnostics,
+    }
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+    archive_path = PERPLEXITY_ARCHIVE_DIR / f"summary_{stamp}.json"
+    _atomic_write_text(archive_path, content)
+    _atomic_write_text(PERPLEXITY_LATEST_SUMMARY_PATH, content)
+    return PERPLEXITY_LATEST_SUMMARY_PATH, archive_path
+
+
+def build_perplexity_snapshot_prompt(previous_summary_5_lines: str | None = None) -> str:
+    continuity_block = (
+        f"Résumé précédent (pour continuité):\n{previous_summary_5_lines}\n\n"
+        if previous_summary_5_lines
+        else "Aucun résumé précédent disponible.\n\n"
+    )
+    return (
+        "Rôle: analyste de desk actions US. Réponds UNIQUEMENT en langage naturel (pas de JSON).\n"
+        "Objectif: snapshot marché ultra-frais orienté exécution, avec équilibre 50% continuité / 50% nouveauté.\n\n"
+        f"{continuity_block}"
+        "Contraintes éditoriales obligatoires:\n"
+        "1) Section 'Continuité depuis run précédent': confirme ce qui reste valide vs invalide.\n"
+        "2) Section 'Nouveautés fraîches (<6h)': événements et signaux très récents avec timestamp approximatif.\n"
+        "3) Section 'Thèmes nouveaux': ouvre sur des angles non abordés précédemment (évite la redite).\n"
+        "4) Mentionne explicitement les actifs/tickers impliqués quand possible.\n"
+        "5) Termine impérativement avec le bloc exact:\n"
+        f"{SUMMARY_START_MARKER}\n"
+        "- ligne 1\n"
+        "- ligne 2\n"
+        "- ligne 3\n"
+        "- ligne 4\n"
+        "- ligne 5\n"
+        f"{SUMMARY_END_MARKER}\n\n"
+        "Qualité attendue:\n"
+        "- Priorité à la fraîcheur et aux sources finance fiables.\n"
+        "- Pas de contenu générique ni de recommandation d'achat/vente directe.\n"
+        "- Ne pas répéter uniquement les mêmes thèmes; introduire de la nouveauté utile.\n"
+    )
+
+
 def perplexity_market_snapshot_raw() -> dict[str, Any]:
     settings = Settings.from_env(require_openrouter=False)
     if not settings.perplexity_api_key:
@@ -187,7 +205,9 @@ def perplexity_market_snapshot_raw() -> dict[str, Any]:
     from perplexity import Perplexity
 
     client = Perplexity(api_key=settings.perplexity_api_key)
-    requested_at_utc = datetime.now(timezone.utc).isoformat()
+    requested_at_utc = _utc_now().isoformat()
+    previous_summary_5_lines = _load_latest_summary_text()
+
     domain_denylist = [
         "-reddit.com",
         "-pinterest.com",
@@ -197,40 +217,41 @@ def perplexity_market_snapshot_raw() -> dict[str, Any]:
         "-facebook.com",
         "-wikipedia.org",
     ]
-
     completion = client.chat.completions.create(
         model=settings.perplexity_model,
         messages=[
             {"role": "system", "content": settings.perplexity_snapshot_system_prompt},
-            {"role": "user", "content": build_perplexity_snapshot_prompt()},
+            {
+                "role": "user",
+                "content": build_perplexity_snapshot_prompt(previous_summary_5_lines),
+            },
         ],
         search_recency_filter=settings.perplexity_snapshot_search_recency,
         search_domain_filter=domain_denylist,
         web_search_options={"search_context_size": settings.perplexity_snapshot_search_context_size},
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "market_snapshot_us_equities",
-                "strict": True,
-                "schema": MarketSnapshot.model_json_schema(),
-            },
-        },
         max_tokens=settings.perplexity_snapshot_max_tokens,
     )
 
-    raw_content = _extract_message_content_text(completion.choices[0].message.content)
-    if not raw_content:
+    snapshot_text = _extract_message_content_text(completion.choices[0].message.content)
+    if not snapshot_text:
         raise RuntimeError("Perplexity returned empty message content.")
 
-    try:
-        parsed = json.loads(raw_content)
-        if not parsed.get("as_of_utc"):
-            parsed["as_of_utc"] = requested_at_utc
-        if not parsed.get("window"):
-            parsed["window"] = "last_24h"
-        snapshot = MarketSnapshot.model_validate(parsed)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        raise RuntimeError(f"Perplexity snapshot response validation failed: {exc}") from exc
+    summary_5_lines = _extract_summary_5_lines(snapshot_text)
+    diagnostics: list[str] = []
+    if not summary_5_lines:
+        diagnostics.append("missing_summary_5_lines")
+
+    overlap = _overlap_ratio(previous_summary_5_lines or "", summary_5_lines or "")
+    if previous_summary_5_lines and overlap >= 0.65:
+        diagnostics.append("low_novelty")
+
+    persisted_paths = _persist_latest_summary(
+        summary_5_lines=summary_5_lines,
+        requested_at_utc=requested_at_utc,
+        model=settings.perplexity_model,
+        overlap_ratio=overlap,
+        diagnostics=diagnostics,
+    )
 
     return {
         "provider": "perplexity",
@@ -238,16 +259,20 @@ def perplexity_market_snapshot_raw() -> dict[str, Any]:
         "model": settings.perplexity_model,
         "search_recency_filter": settings.perplexity_snapshot_search_recency,
         "search_domain_filter": domain_denylist,
-        "snapshot": snapshot.model_dump(),
+        "snapshot_text": snapshot_text,
+        "summary_5_lines": summary_5_lines,
+        "previous_summary_5_lines": previous_summary_5_lines,
+        "novelty_overlap_ratio": overlap,
+        "quality_diagnostics": diagnostics,
         "search_results": _extract_search_results(completion),
         "citations": _extract_citations(completion),
+        "summary_memory_latest_path": str(persisted_paths[0]) if persisted_paths else None,
+        "summary_memory_archive_path": str(persisted_paths[1]) if persisted_paths else None,
     }
 
 
 def compact_perplexity_snapshot_for_prompt(payload: dict[str, Any], max_sources: int = 5) -> dict[str, Any]:
-    snapshot = payload.get("snapshot") or {}
     search_results = payload.get("search_results") or []
-
     compact_sources: list[dict[str, Any]] = []
     for item in search_results[:max_sources]:
         if not isinstance(item, dict):
@@ -261,11 +286,15 @@ def compact_perplexity_snapshot_for_prompt(payload: dict[str, Any], max_sources:
             }
         )
 
+    snapshot_text = str(payload.get("snapshot_text") or "")
+    summary_5_lines = str(payload.get("summary_5_lines") or "")
     return {
         "provider": payload.get("provider"),
         "requested_at_utc": payload.get("requested_at_utc"),
         "model": payload.get("model"),
-        "search_recency_filter": payload.get("search_recency_filter"),
-        "snapshot": snapshot,
-        "sources": compact_sources,
+        "summary_5_lines": summary_5_lines,
+        "novelty_overlap_ratio": payload.get("novelty_overlap_ratio"),
+        "quality_diagnostics": payload.get("quality_diagnostics") or [],
+        "snapshot_text_excerpt": snapshot_text[:2000],
+        "top_sources": compact_sources,
     }
